@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.npm-cache/
+.local/
+tmp/
+reports/
+*.pdf
+*.log
+.env
+!.env.example
+coverage/
