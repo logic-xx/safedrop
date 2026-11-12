@@ -1,11 +1,14 @@
 node_modules/
 dist/
+build/
 .npm-cache/
 .local/
 tmp/
 reports/
+output/
 *.pdf
 *.log
 .env
 !.env.example
 coverage/
+notes/private/

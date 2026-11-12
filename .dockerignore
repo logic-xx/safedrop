@@ -1,0 +1,12 @@
+node_modules
+dist
+build
+.local
+.git
+.npm-cache
+tmp
+reports
+*.pdf
+*.log
+.env
+notes

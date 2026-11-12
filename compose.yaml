@@ -1,0 +1,49 @@
+name: safedrop
+services:
+  app:
+    build: .
+    image: safedrop:0.1.0
+    environment:
+      APP_ORIGIN: https://localhost:8443
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    init: true
+    tmpfs: [/tmp:size=32m,noexec,nosuid]
+    volumes:
+      - app_data:/data
+      - ./reports:/app/reports:ro
+    networks: [backend]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+  gateway:
+    image: caddy:2.11.9-alpine
+    ports: ["127.0.0.1:8443:8443"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    volumes:
+      - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [backend]
+    depends_on:
+      app: {condition: service_healthy}
+    restart: unless-stopped
+networks:
+  backend: {internal: true}
+volumes:
+  app_data:
+  caddy_data:
+  caddy_config:

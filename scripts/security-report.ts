@@ -1,0 +1,9 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { runSuite } from '../tests/suite.ts';
+const report = await runSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`));
+mkdirSync('reports', { recursive: true });
+writeFileSync('reports/latest.json', JSON.stringify(report, null, 2));
+const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+writeFileSync('reports/latest.html', `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>SafeDrop 安全验证报告</title><style>body{font:15px system-ui;max-width:980px;margin:50px auto;color:#273b36;padding:20px}h1{font-size:30px}article{padding:18px;border-bottom:1px solid #ddd}b{color:#157b5c}small{color:#7b8583}p{line-height:1.8}</style><h1>SafeDrop · 安全验证报告</h1><p>${esc(report.created)} · ${esc(report.node)} · ${esc(report.platform)}</p><h2>${report.passed} / ${report.results.length} 通过</h2>${report.results.map(r => `<article><b>${r.ok ? 'PASS' : 'FAIL'}</b> ${esc(r.name)} <small>${r.ms} ms</small><p>${esc(r.detail)}</p></article>`).join('')}<p>本报告来自独立本地测试环境；结果仅证明所列场景，不能代替完整安全评估。</p></html>`);
+console.log(`报告已保存到 reports/latest.html 与 reports/latest.json。${report.passed}/${report.results.length} 通过。`);
+if (report.passed !== report.results.length) process.exitCode = 1;

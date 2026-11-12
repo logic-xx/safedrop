@@ -1,0 +1,58 @@
+# SafeDrop
+
+安全文件传输与审计平台。
+
+SafeDrop 将加密传输、身份验证、断点续传和可校验操作记录放在同一个工作空间。采用 Vue 3、TypeScript、Node.js 和 SQLite，支持本地运行及 Docker Compose 部署。
+
+![SafeDrop 登录界面](docs/screenshots/login.jpg)
+
+## 功能
+
+- **安全通道**：HTTPS/WSS，严格校验证书，持续连接与心跳检测。
+- **可恢复传输**：二进制分块、完整文件 SHA-256 校验、上传与下载续传。
+- **多任务处理**：同时上传和下载多个文件，独立进度与暂停控制。
+- **身份与权限**：口令及 P-256 公钥认证、用户文件隔离、会话查看与撤销。
+- **资源控制**：按账号汇总的带宽限制、消息大小与并发上限、文件存储配额。
+- **可验证记录**：安全事件时间线、审计哈希链、独立检查点及离线校验工具。
+- **安全验证**：独立运行 TLS/WSS 集成测试，生成 HTML 与 JSON 报告。
+
+## 本地运行
+
+需要 Node.js 24.14+（24.x）、npm 和 OpenSSL。
+
+```sh
+npm ci
+npm run setup
+npm run build
+npm start
+```
+
+入口为 `https://localhost:8443`。初始化生成的账号资料位于 `.local/accounts.json`，本地 CA 公共证书位于 `.local/tls/ca.crt`。请核对并信任本地 CA 后连接；不要关闭证书验证。
+
+账号资料、私钥和运行数据均不纳入源码仓库。
+
+## 文档
+
+- [运行与部署](docs/运行与验收.md)：启动、账号初始化、文件传输、Docker Compose 与公网 HTTPS 配置。
+- [协议与安全设计](docs/协议与安全设计.md)：报文格式、认证、续传、限速、审计和信任边界。
+
+## 验证
+
+```sh
+npm test
+npm run security:report
+```
+
+报告输出到 `reports/latest.html` 和 `reports/latest.json`。测试使用独立的临时账号与数据，生产界面只读取报告，不提供远程触发测试的接口。
+
+管理员导出的审计日志可以对照独立保存的检查点校验：
+
+```sh
+npm run audit:verify -- audit.json checkpoint.json
+```
+
+## 部署
+
+本地部署使用 `compose.yaml`，公网部署使用 `compose.public.yaml`。公网入口由 Caddy 管理 Let's Encrypt 证书，应用服务仅位于容器内部网络。完整前提和验证状态见运行文档。
+
+当前版本为 0.1.0。公开部署前需要完成容器运行验证、浏览器文件恢复验收、账号生命周期管理及全局存储监控。安全验证结果仅覆盖列出的场景，不等同于全面安全审计。

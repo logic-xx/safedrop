@@ -1,18 +1,33 @@
 {
-  "name": "safedrop-lab",
+  "name": "safedrop",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.14.0 <25" },
+  "engines": {
+    "node": ">=24.14.0 <25"
+  },
   "scripts": {
     "setup": "tsx scripts/setup.ts",
     "dev": "tsx watch server/index.ts",
     "start": "tsx server/index.ts",
-    "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && vite build",
+    "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && tsc -p tsconfig.runtime.json && vite build",
     "test": "tsx --test tests/*.test.ts",
     "security:report": "tsx scripts/security-report.ts",
     "audit:verify": "tsx scripts/verify-audit.ts"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "@noble/hashes": "2.4.0",
+    "vue": "3.5.45",
+    "ws": "8.22.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/ws": "8.18.2",
+    "@vitejs/plugin-vue": "6.0.10",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vite": "8.3.8",
+    "vue-tsc": "3.3.14"
+  },
+  "description": "Secure file transfer with resumable uploads, public-key authentication and verifiable audit records."
 }

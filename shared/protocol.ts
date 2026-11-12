@@ -6,7 +6,7 @@ export type Metadata = Record<string, unknown>;
 export interface Frame { type: number; requestId: number; streamId: number; meta: Metadata; payload: Uint8Array }
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
-export function encode(type: number, requestId: number, meta: Metadata, payload = new Uint8Array(0), streamId = 0): Uint8Array {
+export function encode(type: number, requestId: number, meta: Metadata, payload: Uint8Array = new Uint8Array(0), streamId = 0): Uint8Array {
   const json = encoder.encode(JSON.stringify(meta));
   if (json.length > MAX_META || payload.length > CHUNK) throw new Error('FRAME_TOO_LARGE');
   const out = new Uint8Array(HEADER + json.length + payload.length);
