@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { createServer } from 'node:https';
 import { createApp } from '../server/app.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { checkContainer } from './container-smoke.ts';
@@ -12,6 +13,17 @@ test('deployment verifier checks real HTTPS/WSS and persistence across service r
   mkdirSync('tmp', { recursive: true }); const root = mkdtempSync(resolve('tmp/container-verifier-'));
   certificates(join(root, 'tls')); const ca = readFileSync(join(root, 'tls/ca.crt'));
   const tls = { cert: readFileSync(join(root, 'tls/server.crt')), key: readFileSync(join(root, 'tls/server.key')) };
+  // An invalid gateway policy must fail verification before attempting login.
+  const duplicateHeaderServer = createServer(tls, (req, res) => {
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    res.setHeader('Strict-Transport-Security', ['max-age=31536000', 'max-age=31536000']);
+    res.end(req.url === '/health' ? '{"status":"ok","protocol":"SFT/1"}' : 'SafeDrop');
+  });
+  duplicateHeaderServer.listen(0, '127.0.0.1'); await once(duplicateHeaderServer, 'listening');
+  try {
+    const duplicatePort = (duplicateHeaderServer.address() as { port: number }).port;
+    await assert.rejects(checkContainer({ origin: `https://localhost:${duplicatePort}`, ca, accounts: [], statePath: join(root, 'unused.json'), phase: 'seed' }), /Expected exactly one HSTS response header/);
+  } finally { await new Promise<void>((resolve, reject) => duplicateHeaderServer.close(error => error ? reject(error) : resolve())); }
   // Select an available local port before fixing the origin used by the service.
   let app = createApp({ root: join(root, 'data'), origin: 'https://localhost', tls });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening');

@@ -53,10 +53,10 @@ export async function checkContainer(options: ContainerCheckOptions) {
   const { origin, ca, accounts, statePath, phase } = options, peers: Peer[] = [], checks: string[] = [];
   const target = new URL(origin);
   assert.equal(target.protocol, 'https:'); assert.equal(target.hostname, 'localhost');
-  const get = (path: string, servername = 'localhost') => new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; body: string }>((resolve, reject) => {
+  const get = (path: string, servername = 'localhost') => new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; hstsCount: number; body: string }>((resolve, reject) => {
     const req = request({ hostname: '127.0.0.1', port: target.port || 443, servername, ca, path, headers: { Host: target.host }, timeout: 2000, rejectUnauthorized: true }, res => {
       let body = ''; res.on('data', data => { body += data; });
-      res.on('error', reject); res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+      res.on('error', reject); res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, hstsCount: res.rawHeaders.filter((name, index) => index % 2 === 0 && name.toLowerCase() === 'strict-transport-security').length, body }));
     });
     req.on('timeout', () => req.destroy(new Error('HTTPS_TIMEOUT'))); req.on('error', reject); req.end();
   });
@@ -95,10 +95,11 @@ export async function checkContainer(options: ContainerCheckOptions) {
     assert.ok(ready, 'HTTPS health endpoint did not become ready');
     const page = await get('/'); assert.equal(page.status, 200); assert.match(page.body, /SafeDrop/);
     assert.match(String(page.headers['content-security-policy']), /frame-ancestors 'none'/);
-    assert.match(String(page.headers['strict-transport-security']), /max-age=31536000/);
+    assert.equal(page.hstsCount, 1, 'Expected exactly one HSTS response header');
+    assert.equal(page.headers['strict-transport-security'], 'max-age=31536000', 'Expected a single valid HSTS policy');
     assert.equal(page.headers['x-content-type-options'], 'nosniff');
     await assert.rejects(get('/health', 'wrong-host.invalid'));
-    checks.push('HTTPS certificate/hostname validation, Vue page and security headers');
+    checks.push('HTTPS certificate/hostname validation, Vue page and security headers (single HSTS policy)');
     await assert.rejects(connect('https://attacker.invalid'));
     const peer = await connect(); await assert.rejects(peer.rpc('files.list'), /AUTH_REQUIRED/);
     const alice = accounts.find(account => account.name === 'alice'); assert.ok(alice);
@@ -130,7 +131,7 @@ export async function checkContainer(options: ContainerCheckOptions) {
     }
     assert.equal((await peer.rpc('hello')).meta.connection, connection);
     checks.push('The WSS connection is reused across file operations');
-    return { phase, ok: true, checks };
+    return { version: 2, phase, ok: true, checks };
   } finally { for (const peer of peers) peer.close(); }
 }
 
