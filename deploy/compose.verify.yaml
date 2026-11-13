@@ -1,0 +1,8 @@
+# Use with the root compose.yaml and project name safedrop-check.
+services:
+  app:
+    image: safedrop:verify
+    environment:
+      APP_ORIGIN: https://localhost:18443
+  gateway:
+    ports: !override ["127.0.0.1:18443:8443"]

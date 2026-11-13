@@ -13,7 +13,7 @@ services:
     mem_limit: 512m
     cpus: 1.0
     init: true
-    tmpfs: [/tmp:size=32m,noexec,nosuid]
+    tmpfs: ["/tmp:size=32m,noexec,nosuid"]
     volumes:
       - app_data:/data
       - ./reports:/app/reports:ro

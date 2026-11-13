@@ -55,4 +55,12 @@ npm run audit:verify -- audit.json checkpoint.json
 
 本地部署使用 `compose.yaml`，公网部署使用 `compose.public.yaml`。公网入口由 Caddy 管理 Let's Encrypt 证书，应用服务仅位于容器内部网络。完整前提和验证状态见运行文档。
 
+Windows 下可在已启动 Docker Desktop 的普通 PowerShell 中运行独立容器验收：
+
+```powershell
+.\scripts\verify-container.ps1
+```
+
+工具使用单独的 `safedrop-check` 项目、数据卷及 `18443` 本机端口，检查容器权限、HTTPS/WSS 传输、重启后的文件与续传位置，并输出 `reports/container-latest.json`。工具不会修改系统证书信任；凭据只存放在忽略提交的 `.local/container-check/` 中。
+
 当前版本为 0.1.0。公开部署前需要完成容器运行验证、浏览器文件恢复验收、账号生命周期管理及全局存储监控。安全验证结果仅覆盖列出的场景，不等同于全面安全审计。
