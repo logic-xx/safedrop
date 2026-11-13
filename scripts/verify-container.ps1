@@ -25,6 +25,13 @@ try {
     $composeModel = Invoke-DockerChecked @composeArgs config --format json | ConvertFrom-Json
     $temporaryMounts = @($composeModel.services.app.tmpfs)
     Assert-Condition ($temporaryMounts.Count -eq 1 -and $temporaryMounts[0] -eq '/tmp:size=32m,noexec,nosuid') 'The temporary mount must preserve its size and security options as one entry.'
+    $configuredAppNetworks = @($composeModel.services.app.networks.PSObject.Properties.Name)
+    Assert-Condition ($configuredAppNetworks.Count -eq 1) 'The application must use exactly one internal backend network.'
+    $backendName = $configuredAppNetworks[0]
+    Assert-Condition ([bool]$composeModel.networks.PSObject.Properties[$backendName].Value.internal) 'The application backend network must be internal.'
+    $configuredGatewayNetworks = @($composeModel.services.gateway.networks.PSObject.Properties.Name)
+    $configuredIngress = @($configuredGatewayNetworks | Where-Object { -not [bool]$composeModel.networks.PSObject.Properties[$_].Value.internal })
+    Assert-Condition ($configuredGatewayNetworks.Count -eq 2 -and $configuredGatewayNetworks -contains $backendName -and $configuredIngress.Count -eq 1) 'The gateway needs the shared backend and one non-internal ingress network to publish its HTTPS port.'
     Assert-Condition (Test-Path -LiteralPath 'node_modules/tsx/dist/cli.mjs') 'Run npm ci before verification.'
     if ($CheckOnly) { Write-Host 'PASS Compose configuration and local prerequisites. No engine access or containers changed.'; return }
     $engineType = (& docker info --format '{{.OSType}}')
@@ -33,7 +40,7 @@ try {
     $privateDir = Join-Path $projectRoot '.local/container-check'
     New-Item -ItemType Directory -Path $privateDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $projectRoot 'reports') -Force | Out-Null
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
@@ -60,6 +67,9 @@ try {
     $gatewayId = (Invoke-DockerChecked @composeArgs ps --quiet gateway).Trim()
     $appInfo = @(Invoke-DockerChecked inspect $appId | ConvertFrom-Json)[0]
     $gatewayInfo = @(Invoke-DockerChecked inspect $gatewayId | ConvertFrom-Json)[0]
+    # Save only non-secret configuration so a failed check can be diagnosed.
+    $runtimeEvidence = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); appUser = $appInfo.Config.User; appNetworks = @($appInfo.NetworkSettings.Networks.PSObject.Properties.Name); gatewayNetworks = @($gatewayInfo.NetworkSettings.Networks.PSObject.Properties.Name); gatewayRequestedPorts = $gatewayInfo.HostConfig.PortBindings; gatewayPublishedPorts = $gatewayInfo.NetworkSettings.Ports }
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-runtime.json'), ($runtimeEvidence | ConvertTo-Json -Depth 6), $utf8)
     Assert-Condition ($appInfo.Config.User -eq '10001:10001') 'The application is not running as UID/GID 10001.'
     foreach ($serviceInfo in @($appInfo, $gatewayInfo)) {
         Assert-Condition ([bool]$serviceInfo.HostConfig.ReadonlyRootfs) 'A container root filesystem is writable.'
@@ -73,9 +83,16 @@ try {
     Assert-Condition ($networkNames.Count -eq 1) 'The application is attached to unexpected networks.'
     $networkInfo = @(Invoke-DockerChecked network inspect $networkNames[0] | ConvertFrom-Json)[0]
     Assert-Condition ([bool]$networkInfo.Internal) 'The backend network is not internal.'
-    $ports = @($gatewayInfo.NetworkSettings.Ports.'8443/tcp')
-    Assert-Condition ($ports.Count -eq 1 -and $ports[0].HostIp -eq '127.0.0.1' -and $ports[0].HostPort -eq '18443') 'The gateway is not restricted to the verification loopback port.'
-    $profile = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); ok = $true; checks = @('Non-root application', 'Read-only roots', 'All capabilities dropped', 'Privilege escalation disabled', 'Memory/CPU/PID limits', 'Internal backend without published app ports', 'Loopback-only gateway') }
+    $gatewayNetworks = @($gatewayInfo.NetworkSettings.Networks.PSObject.Properties.Name)
+    $ingressNames = @($gatewayNetworks | Where-Object { $_ -ne $networkNames[0] })
+    Assert-Condition ($gatewayNetworks.Count -eq 2 -and $gatewayNetworks -contains $networkNames[0] -and $ingressNames.Count -eq 1) 'The gateway needs the backend and a separate ingress network.'
+    $ingressInfo = @(Invoke-DockerChecked network inspect $ingressNames[0] | ConvertFrom-Json)[0]
+    Assert-Condition (-not [bool]$ingressInfo.Internal) 'The gateway ingress network must permit host port publishing.'
+    $ports = @($gatewayInfo.NetworkSettings.Ports.'8443/tcp' | Where-Object { $null -ne $_ })
+    $portDescription = ConvertTo-Json -InputObject $ports -Compress -Depth 3
+    Assert-Condition ($ports.Count -gt 0) "The gateway HTTPS port was not published. Observed: $portDescription. See reports/container-runtime.json."
+    Assert-Condition ($ports.Count -eq 1 -and $ports[0].HostIp -eq '127.0.0.1' -and $ports[0].HostPort -eq '18443') "Unexpected gateway port binding: $portDescription. Expected only 127.0.0.1:18443."
+    $profile = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); ok = $true; checks = @('Non-root application', 'Read-only roots', 'All capabilities dropped', 'Privilege escalation disabled', 'Memory/CPU/PID limits', 'Internal backend without published app ports', 'Separate gateway ingress network', 'Loopback-only gateway') }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-profile.json'), ($profile | ConvertTo-Json -Depth 4), $utf8)
     & node 'node_modules/tsx/dist/cli.mjs' 'tests/container-smoke.ts' seed $privateDir
     if ($LASTEXITCODE -ne 0) { throw 'HTTPS/WSS transfer checks failed before restart.' }

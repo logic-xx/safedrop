@@ -37,12 +37,13 @@ services:
       - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    networks: [backend]
+    networks: [backend, edge]
     depends_on:
       app: {condition: service_healthy}
     restart: unless-stopped
 networks:
   backend: {internal: true}
+  edge: {}
 volumes:
   app_data:
   caddy_data:
