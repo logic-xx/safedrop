@@ -4,5 +4,5 @@
     "module": "NodeNext", "moduleResolution": "NodeNext", "noEmit": false,
     "rewriteRelativeImportExtensions": true, "outDir": "build", "rootDir": "."
   },
-  "include": ["server/**/*.ts", "shared/**/*.ts", "scripts/setup.ts", "scripts/certificates.ts"]
+  "include": ["server/**/*.ts", "shared/**/*.ts", "scripts/setup.ts", "scripts/certificates.ts", "scripts/maintenance.ts"]
 }

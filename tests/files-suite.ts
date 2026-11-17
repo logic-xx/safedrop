@@ -189,9 +189,9 @@ export async function runFileSuite(onResult?: (r: Result) => void) {
     await f.owner.rpc('upload.chunk', { transferId, offset: 0 }, bytes.subarray(0, 17));
     const invite = (await f.admin.rpc('invitations.create', { hours: 1 })).meta, anchor = f.app.store.checkpoint();
     // Version 1 has exactly these unchanged tables and no deletion table.
-    f.app.store.db.exec('DROP TABLE deliveries; DROP TABLE deletions; PRAGMA user_version=1;');
+    f.app.store.db.exec('DROP TABLE transfer_activity; DROP TABLE deliveries; DROP TABLE deletions; PRAGMA user_version=1;');
     await f.restart(); const owner = await f.login(), admin = await f.login('admin');
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 3); assert.equal((await f.usage(owner)).used, bytes.length); assert.equal((await f.usage(owner)).reserved, bytes.length);
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 4); assert.equal((await f.usage(owner)).used, bytes.length); assert.equal((await f.usage(owner)).reserved, bytes.length);
     assert.equal(digest((await owner.rpc('download.chunk', { fileId, offset: 0 })).payload), digest(bytes));
     assert.equal((await owner.rpc('upload.init', { transferId, name: '续传.bin', size: bytes.length, sha256: digest(bytes) })).meta.offset, 17);
     assert.equal(f.app.store.get('SELECT id FROM invitations WHERE id=?', invite.id)!.id, invite.id);

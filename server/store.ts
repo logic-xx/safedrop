@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes, randomUUID, scrypt as rawScrypt, timingSafeEqual } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const digest = (s: string | Uint8Array) => createHash('sha256').update(s).digest('hex');
@@ -27,7 +27,9 @@ export function verifyAudit(rows: Row[], anchor?: Checkpoint) {
 }
 export class Store {
   db: DatabaseSync;
-  constructor(public root: string) {
+  auditBytes = 0;
+  constructor(public root: string, public auditLimit = Number.MAX_SAFE_INTEGER) {
+    need(!existsSync(join(root, '.restore-incomplete')), 'RESTORE_INCOMPLETE');
     mkdirSync(join(root, 'objects'), { recursive: true }); mkdirSync(join(root, 'staging'), { recursive: true });
     this.db = new DatabaseSync(join(root, 'safedrop.sqlite'));
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -39,7 +41,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
     // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
     const version = this.get('PRAGMA user_version')!.user_version;
-    need(version <= 3, 'DATABASE_VERSION_UNSUPPORTED');
+    need(version <= 4, 'DATABASE_VERSION_UNSUPPORTED');
     if (version < 1) this.transaction(() => {
       this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
@@ -60,14 +62,20 @@ export class Store {
         CREATE INDEX deliveries_owner ON deliveries(ownerId,created DESC,id DESC);
         PRAGMA user_version=3;`);
     });
+    if (version < 4) this.transaction(() => {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS transfer_activity(id TEXT PRIMARY KEY,touched INTEGER NOT NULL);
+        PRAGMA user_version=4;`);
+    });
+    this.auditBytes = this.get('SELECT COALESCE(SUM(length(CAST(event AS BLOB))+128),0) AS n FROM audit')!.n;
   }
   get(sql: string, ...args: any[]): Row | undefined { return this.db.prepare(sql).get(...args) as Row | undefined; }
   all(sql: string, ...args: any[]): Row[] { return this.db.prepare(sql).all(...args) as Row[]; }
   run(sql: string, ...args: any[]) { return this.db.prepare(sql).run(...args); }
   transaction<T>(fn: () => T): T {
+    const auditBytes = this.auditBytes;
     this.db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
-    catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    catch (e) { this.db.exec('ROLLBACK'); this.auditBytes = auditBytes; throw e; }
   }
   registration() { return this.get("SELECT value FROM settings WHERE key='registration'")!.value as string; }
   usage(userId: string, limit: number) {
@@ -81,8 +89,10 @@ export class Store {
   }
   audit(user: string, action: string, result: string, detail: Record<string, unknown> = {}) {
     const event = JSON.stringify({ time: new Date().toISOString(), user, action, result, detail });
+    const bytes = Buffer.byteLength(event) + 128; need(this.auditBytes + bytes <= this.auditLimit, 'AUDIT_CAPACITY');
     const last = this.get('SELECT seq,hash FROM audit ORDER BY seq DESC LIMIT 1');
     const prev = last?.hash ?? '0'.repeat(64); this.run('INSERT INTO audit VALUES(?,?,?,?)', (last?.seq ?? 0) + 1, event, prev, digest(prev + event));
+    this.auditBytes += bytes;
   }
   checkpoint(): Checkpoint { const r = this.get('SELECT seq,hash FROM audit ORDER BY seq DESC LIMIT 1'); return { count: r?.seq ?? 0, head: r?.hash ?? '0'.repeat(64) }; }
   close() { this.db.close(); }

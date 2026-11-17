@@ -6,7 +6,7 @@ const db = new DatabaseSync(join(resolve(process.env.DATA_DIR ?? '.local/data'),
 try {
   db.exec('BEGIN');
   const tables = {};
-  for (const table of ['users', 'sessions', 'keys', 'files', 'transfers', 'audit', 'settings', 'invitations', 'deletions', 'deliveries']) {
+  for (const table of ['users', 'sessions', 'keys', 'files', 'transfers', 'audit', 'settings', 'invitations', 'deletions', 'deliveries', 'transfer_activity']) {
     if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
     const rows = db.prepare(`SELECT * FROM ${table}`).all(), records = {};
     for (const row of rows) {

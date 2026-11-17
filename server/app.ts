@@ -1,6 +1,6 @@
 import { createServer as httpsServer } from 'node:https';
 import { createServer as httpServer, type IncomingMessage } from 'node:http';
-import { readFileSync, existsSync, createReadStream } from 'node:fs';
+import { readFileSync, existsSync, createReadStream, statSync } from 'node:fs';
 import { open, rename, unlink, stat } from 'node:fs/promises';
 import { resolve, join, sep, extname } from 'node:path';
 import { createPublicKey, randomBytes, verify } from 'node:crypto';
@@ -9,8 +9,10 @@ import { CHUNK, MAX_FRAME, encode, decode, type Frame } from '../shared/protocol
 import { Store, Fault, need, text, integer, id, digest, passwordCheck, passwordHash, validAccount, verifyAudit, type Row, type Checkpoint } from './store.ts';
 import { Bandwidth, RateGate } from './limits.ts';
 import { createHash } from 'node:crypto';
+import { StorageGuard, type StoragePolicy } from './storage.ts';
+import { backupList, createBackup } from './backup.ts';
 
-export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number }
+export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number } }
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
@@ -25,12 +27,16 @@ async function hashFile(path: string, bytes?: number, signal?: AbortSignal) {
   return h.digest('hex');
 }
 export function createApp(config: Config) {
-  const store = new Store(config.root);
+  const store = new Store(config.root, config.storage?.auditLimit ?? 64 * 1024 ** 2);
+  const storage = new StorageGuard(store, config.storage ?? {}), backupRoot = resolve(config.storage?.backupRoot ?? config.root + '.backups');
   need(verifyAudit(store.all('SELECT * FROM audit ORDER BY seq')).ok, 'AUDIT_INTEGRITY_FAILURE');
   store.run('UPDATE sessions SET revoked=1 WHERE revoked=0');
   const rate = new RateGate(), bw = new Bandwidth(config.normalRate, config.vipRate);
   const contexts = new Set<Context>(), locks = new Set<string>();
   const operations = new Set<Promise<void>>();
+  const activeDispatches = new Set<Promise<unknown>>();
+  let maintenanceBusy = false, cleanupBusy = false, auditReserved = 0;
+  const readOnly = new Set(['hello', 'ping', 'files.list', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status']);
   type DownloadJob = { abort: AbortController; done: Promise<void>; userId: string; ownerId: string; deliveryId?: string };
   const downloads = new Map<string, Set<DownloadJob>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
@@ -83,9 +89,13 @@ export function createApp(config: Config) {
     const current = store.get('SELECT * FROM users WHERE id=?', u.id);
     need(current && !current.disabled && current.authVersion === u.authVersion, 'INVALID_CREDENTIALS');
     need(store.get('SELECT COUNT(*) AS n FROM sessions WHERE userId=? AND revoked=0 AND expires>?', u.id, Date.now())!.n < 8, 'SESSION_LIMIT');
-    c.user = u; c.session = id();
-    store.run('INSERT INTO sessions VALUES(?,?,?,?,0,?,?)', c.session, u.id, Date.now(), Date.now() + (config.sessionMs ?? 3600000), c.agent, c.ip);
-    audit(c, 'auth.login', 'allowed', { method }); return { user: { name: u.name, role: u.role, tier: u.tier, rate: bw.rate(u.tier) }, session: c.session, connection: c.connection };
+    const session = id();
+    store.transaction(() => {
+      store.run('INSERT INTO sessions VALUES(?,?,?,?,0,?,?)', session, u.id, Date.now(), Date.now() + (config.sessionMs ?? 3600000), c.agent, c.ip);
+      store.audit(u.name, 'auth.login', 'allowed', { method });
+    });
+    c.user = u; c.session = session;
+    return { user: { name: u.name, role: u.role, tier: u.tier, rate: bw.rate(u.tier) }, session: c.session, connection: c.connection };
   }
   function owned(c: Context, table: 'transfers' | 'files', transferId: unknown) {
     const u = authorized(c); const row = store.get(`SELECT * FROM ${table} WHERE id=? AND userId=?`, text(transferId, 80), u.id); need(row, 'NOT_FOUND'); return row;
@@ -135,8 +145,8 @@ export function createApp(config: Config) {
     catch (e) { if (abort.signal.aborted) throw new Fault(job.deliveryId ? 'DELIVERY_UNAVAILABLE' : 'FILE_DELETING'); throw e; }
     finally { jobs.delete(job); if (!jobs.size) downloads.delete(fileId); settled(); }
   }
-  async function erase(c: Context, table: 'transfers' | 'files', targetId: unknown) {
-    const row = owned(c, table, targetId), op = table === 'files' ? 'files.delete' : 'upload.cancel';
+  async function erase(c: Context, table: 'transfers' | 'files', targetId: unknown, expired?: Row) {
+    const row = expired ?? owned(c, table, targetId), op = expired ? 'maintenance.expire' : table === 'files' ? 'files.delete' : 'upload.cancel';
     need(!locks.has(row.id), table === 'files' ? 'FILE_BUSY' : 'TRANSFER_BUSY'); locks.add(row.id);
     try {
       // The durable intent stops future access, but keeps the original row charged.
@@ -157,11 +167,28 @@ export function createApp(config: Config) {
       // Once accepted, finish cleanup even if the requester disconnects or is revoked.
       store.transaction(() => {
         store.run(`DELETE FROM ${table} WHERE id=? AND userId=?`, row.id, row.userId);
+        if (table === 'transfers') store.run('DELETE FROM transfer_activity WHERE id=?', row.id);
         store.run('DELETE FROM deletions WHERE id=? AND kind=?', row.id, table);
         audit(c, op, 'allowed', { id: row.id, size: row.size });
       });
       return { meta: { deleted: true, id: row.id } };
     } finally { locks.delete(row.id); }
+  }
+  async function cleanup(c?: Context) {
+    need(!cleanupBusy && !maintenanceBusy, 'MAINTENANCE_BUSY'); cleanupBusy = true;
+    const result = { removed: 0, failed: 0, activeSkipped: 0 };
+    try {
+      for (const row of storage.expired()) {
+        if (locks.has(row.id)) { result.activeSkipped++; continue; }
+        const current = store.get('SELECT t.id FROM transfers t LEFT JOIN transfer_activity a ON a.id=t.id WHERE t.id=? AND COALESCE(a.touched,t.created)<?', row.id, Date.now() - (config.storage?.staleMs ?? 7 * 86400000));
+        if (!current) { result.activeSkipped++; continue; }
+        const user = store.get('SELECT * FROM users WHERE id=?', row.userId);
+        const actor = c ?? { user } as Context;
+        try { await erase(actor, 'transfers', row.id, row); result.removed++; }
+        catch { result.failed++; }
+      }
+      return result;
+    } finally { cleanupBusy = false; }
   }
   async function dispatch(c: Context, f: Frame): Promise<{ meta?: Row; payload?: Uint8Array }> {
     const m = f.meta, op = text(m.op, 64);
@@ -220,6 +247,25 @@ export function createApp(config: Config) {
       return { meta: establish(c, store.get('SELECT * FROM users WHERE id=?', challenge.key.userId)!, 'public-key') };
     }
     const u = authorized(c);
+    if (op === 'maintenance.status') {
+      admin(c); const backups = await backupList(backupRoot);
+      return { meta: { storage: storage.usage(), audit: { bytes: store.auditBytes, limit: store.auditLimit, protected: store.auditBytes + 65536 > store.auditLimit }, staleDays: (config.storage?.staleMs ?? 7 * 86400000) / 86400000, expiredBatch: storage.expired().length, cleanupAutomatic: Boolean(config.storage?.cleanupIntervalMs), backups, backupCount: config.storage?.backupCount ?? 3, busy: maintenanceBusy } };
+    }
+    if (op === 'maintenance.cleanup') {
+      admin(c); need(m.confirm === '清理过期上传', 'INVALID_INPUT'); need(rate.allow('maintenance:' + u.id, 6), 'RATE_LIMITED');
+      return { meta: await cleanup(c) };
+    }
+    if (op === 'maintenance.backup') {
+      admin(c); need(rate.allow('maintenance:' + u.id, 6), 'RATE_LIMITED'); need(!maintenanceBusy && !cleanupBusy, 'MAINTENANCE_BUSY');
+      maintenanceBusy = true;
+      try {
+        await Promise.allSettled([...activeDispatches]); authorized(c);
+        audit(c, 'maintenance.backup.begin', 'allowed');
+        const s = storage.usage();
+        const result = await createBackup(store, backupRoot, { quota: config.storage?.backupQuota ?? 20 * 1024 ** 3, count: config.storage?.backupCount ?? 3, minFree: s.minFree, pending: s.pending });
+        audit(c, 'maintenance.backup', 'allowed', { backupId: result.id, bytes: result.bytes }); return { meta: result };
+      } finally { maintenanceBusy = false; }
+    }
     if (op === 'account.password') {
       need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED');
       const oldPass = text(m.password, 256), newPass = text(m.newPassword, 256); validAccount(u.name, newPass);
@@ -312,12 +358,14 @@ export function createApp(config: Config) {
     if (op === 'upload.init') {
       const name = filename(m.name);
       const size = integer(m.size, config.maxFile ?? 512 * 1024 ** 2), sha = text(m.sha256, 64); need(/^[a-f0-9]{64}$/.test(sha), 'INVALID_HASH');
-      if (m.transferId) { const t = store.get('SELECT * FROM transfers WHERE id=? AND userId=?', text(m.transferId, 80), u.id) ?? store.get('SELECT *,size AS offset,1 AS completed FROM files WHERE id=? AND userId=?', m.transferId, u.id); need(t, 'NOT_FOUND'); notDeleting(t.completed ? 'files' : 'transfers', t.id); need(t.name === name && t.size === size && t.sha256 === sha, 'FILE_CHANGED'); return { meta: t }; }
+      if (m.transferId) { const t = store.get('SELECT * FROM transfers WHERE id=? AND userId=?', text(m.transferId, 80), u.id) ?? store.get('SELECT *,size AS offset,1 AS completed FROM files WHERE id=? AND userId=?', m.transferId, u.id); need(t, 'NOT_FOUND'); notDeleting(t.completed ? 'files' : 'transfers', t.id); need(t.name === name && t.size === size && t.sha256 === sha, 'FILE_CHANGED'); if (!t.completed) storage.touch(t.id); return { meta: t }; }
       const usage = store.usage(u.id, config.quota ?? 1024 ** 3);
       need(usage.fileCount + usage.transferCount < 1000, 'FILE_COUNT_LIMIT');
       need(usage.transferCount < 16, 'TRANSFER_LIMIT');
       need(usage.used + usage.reserved + size <= usage.limit, 'STORAGE_QUOTA');
+      storage.allocate(size);
       const transferId = id(); store.run('INSERT INTO transfers VALUES(?,?,?,?,?,0,?)', transferId, u.id, name, size, sha, Date.now());
+      storage.touch(transferId);
       locks.add(transferId);
       try {
         try { const h = await open(join(config.root, 'staging', transferId), 'wx', 0o600); await h.close(); }
@@ -336,6 +384,7 @@ export function createApp(config: Config) {
         if (op === 'upload.chunk') {
           const offset = integer(m.offset, t.size); need(f.payload.length > 0 && offset + f.payload.length <= t.size && offset <= t.offset, 'INVALID_OFFSET');
           await bw.take(u.id, u.tier, f.payload.length, c.abort.signal); authorized(c);
+          storage.write();
           const h = await open(path, 'r+');
           try {
             authorized(c);
@@ -347,6 +396,7 @@ export function createApp(config: Config) {
               await h.sync(); authorized(c); store.run('UPDATE transfers SET offset=? WHERE id=?', offset + written, t.id); t.offset = offset + written;
             }
           } finally { await h.close(); }
+          storage.touch(t.id);
           return { meta: { offset: t.offset } };
         }
         need(t.offset === t.size, 'INCOMPLETE_FILE'); need(hashing < 4, 'SERVER_BUSY'); hashing++;
@@ -355,9 +405,8 @@ export function createApp(config: Config) {
           need((await stat(source)).size === t.size && await hashFile(source) === t.sha256, 'HASH_MISMATCH'); authorized(c);
           if (source !== final) await rename(path, final);
           authorized(c);
-          store.db.exec('BEGIN IMMEDIATE');
-          try { store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', t.id, u.id, t.name, t.size, t.sha256, Date.now()); store.run('DELETE FROM transfers WHERE id=?', t.id); store.db.exec('COMMIT'); } catch (e) { store.db.exec('ROLLBACK'); throw e; }
-          audit(c, op, 'allowed', { fileId: t.id, size: t.size, sha256: t.sha256 }); return { meta: { fileId: t.id, sha256: t.sha256 } };
+          store.transaction(() => { store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', t.id, u.id, t.name, t.size, t.sha256, Date.now()); store.run('DELETE FROM transfers WHERE id=?', t.id); store.run('DELETE FROM transfer_activity WHERE id=?', t.id); audit(c, op, 'allowed', { fileId: t.id, size: t.size, sha256: t.sha256 }); });
+          return { meta: { fileId: t.id, sha256: t.sha256 } };
         } finally { hashing--; }
       } finally { locks.delete(t.id); }
     }
@@ -383,7 +432,7 @@ export function createApp(config: Config) {
     if (op === 'sessions.revoke' || op === 'auth.logout') {
       const sid = op === 'auth.logout' ? c.session! : text(m.sessionId, 80);
       need(store.get('SELECT id FROM sessions WHERE id=? AND userId=?', sid, u.id), 'NOT_FOUND');
-      store.run('UPDATE sessions SET revoked=1 WHERE id=?', sid); audit(c, 'sessions.revoke', 'allowed', {});
+      store.transaction(() => { store.run('UPDATE sessions SET revoked=1 WHERE id=?', sid); audit(c, 'sessions.revoke', 'allowed', {}); });
       setTimeout(() => { for (const ctx of contexts) if (ctx.session === sid) { ctx.abort.abort(); ctx.ws.close(4001, 'SESSION_REVOKED'); } }, 10);
       return {};
     }
@@ -392,12 +441,12 @@ export function createApp(config: Config) {
       need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED'); authenticating++;
       try { need(await passwordCheck(text(m.password, 256), u.hash), 'INVALID_CREDENTIALS'); } finally { authenticating--; }
       need(authorized(c).authVersion === u.authVersion, 'SESSION_EXPIRED');
-      if (op === 'keys.revoke') { need(store.get('SELECT id FROM keys WHERE id=? AND userId=?', text(m.keyId, 80), u.id), 'NOT_FOUND'); store.run('DELETE FROM keys WHERE id=?', m.keyId); audit(c, op, 'allowed'); return {}; }
+      if (op === 'keys.revoke') { need(store.get('SELECT id FROM keys WHERE id=? AND userId=?', text(m.keyId, 80), u.id), 'NOT_FOUND'); store.transaction(() => { store.run('DELETE FROM keys WHERE id=?', m.keyId); audit(c, op, 'allowed'); }); return {}; }
       need(store.get('SELECT COUNT(*) AS n FROM keys WHERE userId=?', u.id)!.n < 5, 'KEY_LIMIT');
       need(m.jwk && typeof m.jwk === 'object', 'INVALID_KEY'); const j = m.jwk as Row;
       need(j.kty === 'EC' && j.crv === 'P-256' && !j.d && typeof j.x === 'string' && typeof j.y === 'string', 'INVALID_KEY');
       const jwk = createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: j.x, y: j.y }, format: 'jwk' }).export({ format: 'jwk' });
-      const keyId = id(); store.run('INSERT INTO keys VALUES(?,?,?,?,?)', keyId, u.id, JSON.stringify(jwk), text(m.label, 60), Date.now()); audit(c, op, 'allowed', { keyId }); return { meta: { keyId } };
+      const keyId = id(); store.transaction(() => { store.run('INSERT INTO keys VALUES(?,?,?,?,?)', keyId, u.id, JSON.stringify(jwk), text(m.label, 60), Date.now()); audit(c, op, 'allowed', { keyId }); }); return { meta: { keyId } };
     }
     if (op === 'events.list') {
       const events = store.all('SELECT seq,event FROM audit ORDER BY seq DESC LIMIT 300').map(r => ({ seq: r.seq, ...JSON.parse(r.event) })).filter(r => u.role === 'admin' || r.user === u.name || ['deliveries.create', 'deliveries.revoke', 'deliveries.download'].includes(r.action) && (r.detail.ownerId === u.id || r.detail.recipientId === u.id)).slice(0, 24);
@@ -405,7 +454,14 @@ export function createApp(config: Config) {
     }
     if (op === 'audit.page') { admin(c); return { meta: { rows: store.all('SELECT * FROM audit WHERE seq>? ORDER BY seq LIMIT 8', integer(m.after ?? 0)), checkpoint: store.checkpoint() } }; }
     if (op === 'audit.verify') { admin(c); const anchor = m.checkpoint as Checkpoint | undefined; if (anchor) { integer(anchor.count); need(/^[a-f0-9]{64}$/.test(anchor.head), 'INVALID_CHECKPOINT'); } return { meta: verifyAudit(store.all('SELECT * FROM audit ORDER BY seq'), anchor) }; }
-    if (op === 'report.latest') { admin(c); const p = config.reportPath ?? resolve('reports/latest.json'); return { meta: { report: existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null } }; }
+    if (op === 'report.latest') {
+      admin(c); const p = config.reportPath ?? resolve('reports/latest.json');
+      if (!existsSync(p)) return { meta: { report: null } };
+      // Reports grow with the verification suite; keep them out of the 16 KiB metadata field.
+      need(statSync(p).size <= CHUNK, 'REPORT_TOO_LARGE');
+      const payload = readFileSync(p); need(payload.length <= CHUNK, 'REPORT_TOO_LARGE'); JSON.parse(payload.toString('utf8'));
+      return { meta: { reportEncoding: 'json' }, payload };
+    }
     throw new Fault('UNKNOWN_OPERATION');
   }
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
@@ -420,12 +476,18 @@ export function createApp(config: Config) {
       queue = queue.then(async () => {
         let frame: Frame | undefined;
         try {
-          c.abort.signal.throwIfAborted(); frame = decode(bytes); const result = await dispatch(c, frame);
+          c.abort.signal.throwIfAborted(); frame = decode(bytes);
+          need(!maintenanceBusy || ['hello', 'ping', 'maintenance.status'].includes(String(frame.meta.op)), 'MAINTENANCE_BUSY');
+          const reserve = readOnly.has(String(frame.meta.op)) ? 0 : frame.meta.op === 'users.disable' ? 4 * 1024 ** 2 : frame.meta.op === 'maintenance.backup' || String(frame.meta.op).startsWith('auth.') ? 8192 : 65536;
+          need(store.auditBytes + auditReserved + reserve <= store.auditLimit, 'AUDIT_CAPACITY'); auditReserved += reserve;
+          let result: { meta?: Row; payload?: Uint8Array };
+          try { const work = dispatch(c, frame); activeDispatches.add(work); try { result = await work; } finally { activeDispatches.delete(work); } }
+          finally { auditReserved -= reserve; }
           if (frame.meta.op === 'download.chunk' || frame.meta.op === 'download.init') readable(c, frame.meta.fileId, frame.meta.deliveryId);
           if (ws.readyState === WebSocket.OPEN && !c.abort.signal.aborted) ws.send(encode(2, frame.requestId, { ok: true, ...result.meta }, result.payload, frame.streamId));
         } catch (e) {
           const code = e instanceof Fault ? e.code : frame ? 'INTERNAL_ERROR' : 'INVALID_FRAME';
-          if (!c.abort.signal.aborted && rate.allow('audit-denied:' + c.ip, 30)) audit(c, typeof frame?.meta.op === 'string' ? frame.meta.op.slice(0, 64) : 'protocol.invalid', 'denied', { code });
+          if (!c.abort.signal.aborted && store.auditBytes + 4096 < store.auditLimit && rate.allow('audit-denied:' + c.ip, 30)) try { audit(c, typeof frame?.meta.op === 'string' ? frame.meta.op.slice(0, 64) : 'protocol.invalid', 'denied', { code }); } catch { /* A full or failed audit volume must not turn error handling into an uncaught exception. */ }
           if (frame && ws.readyState === WebSocket.OPEN) ws.send(encode(2, frame.requestId, { ok: false, code }));
           else ws.close(4002, 'INVALID_FRAME');
         } finally { c.pending--; queuedBytes -= bytes.length; }
@@ -442,6 +504,11 @@ export function createApp(config: Config) {
       c.alive = false; c.ws.ping();
     }
   }, 20000); heartbeat.unref();
-  store.audit('system', 'server.start', 'allowed', { protocol: 'SFT/1' });
-  return { server, store, bw, async close() { clearInterval(heartbeat); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
+  const cleanupTimer = config.storage?.cleanupIntervalMs ? setInterval(() => {
+    if (!maintenanceBusy && !cleanupBusy && store.auditBytes + auditReserved + 65536 <= store.auditLimit) {
+      auditReserved += 65536; const work = cleanup().then(() => {}, () => {}).finally(() => { auditReserved -= 65536; }); operations.add(work); void work.finally(() => operations.delete(work));
+    }
+  }, config.storage.cleanupIntervalMs) : undefined; cleanupTimer?.unref();
+  if (store.auditBytes + 4096 < store.auditLimit) store.audit('system', 'server.start', 'allowed', { protocol: 'SFT/1' });
+  return { server, store, bw, storage, async close() { clearInterval(heartbeat); clearInterval(cleanupTimer); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
 }

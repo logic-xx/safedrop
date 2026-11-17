@@ -13,7 +13,8 @@
     "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && tsc -p tsconfig.runtime.json && vite build",
     "test": "tsx --test tests/*.test.ts",
     "security:report": "tsx scripts/security-report.ts",
-    "audit:verify": "tsx scripts/verify-audit.ts"
+    "audit:verify": "tsx scripts/verify-audit.ts",
+    "maintenance": "tsx scripts/maintenance.ts"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",

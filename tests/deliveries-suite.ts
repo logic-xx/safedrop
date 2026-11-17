@@ -200,11 +200,11 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
   await run('版本 2 升级：原表指纹、删除意图、邀请和文件任务均保持', async f => {
     const transferId = (await f.owner.rpc('upload.init', { name: '待清理.bin', size: 37, sha256: digest(Buffer.alloc(37)) })).meta.id;
     f.app.store.run("INSERT INTO deletions VALUES(?,'transfers',?,?)", transferId, f.ids.owner, Date.now());
-    await f.admin.rpc('invitations.create', { hours: 1 }); f.app.store.db.exec('DROP TABLE deliveries; PRAGMA user_version=2;');
+    await f.admin.rpc('invitations.create', { hours: 1 }); f.app.store.db.exec('DROP TABLE transfer_activity; DROP TABLE deliveries; PRAGMA user_version=2;');
     const snapshot = () => JSON.parse(execFileSync(process.execPath, [resolve('scripts/data-snapshot.mjs')], { env: { ...process.env, DATA_DIR: f.config.root }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     const before = snapshot(); await f.restart(); const after = snapshot();
     for (const [table, records] of Object.entries(before.tables)) for (const [id, hash] of Object.entries(records as Record<string, string>)) assert.equal(after.tables[table][id], hash);
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 3); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 4); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
   });
   return results;
 }

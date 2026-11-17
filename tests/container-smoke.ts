@@ -13,7 +13,7 @@ import { digest, type Checkpoint } from '../server/store.ts';
 type Account = { name: string; password: string };
 type AccountState = { userId: string; name: string; password: string; token: string; keyId: string };
 type DeliveryState = { active: string; revoked: string; recipientQuota: Metadata };
-type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata; delivery: DeliveryState };
+type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata; delivery: DeliveryState; backupId: string };
 export interface ContainerCheckOptions { origin: string; ca: Buffer; accounts: Account[]; statePath: string; phase: 'seed' | 'resume' }
 
 class Peer {
@@ -191,7 +191,12 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const delivery = await deliveryCheck(peer, bob, admin, fileId, bytes), checkpoint = (await admin.rpc('audit.page')).meta.checkpoint as unknown as Checkpoint;
       // This ignored, private state contains only disposable check credentials, never print it.
       const quota = (await peer.rpc('storage.usage')).meta;
-      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota, delivery };
+      await assert.rejects(peer.rpc('maintenance.status'), /FORBIDDEN/); await assert.rejects(bob.rpc('maintenance.backup'), /FORBIDDEN/);
+      const maintenance = (await admin.rpc('maintenance.status')).meta;
+      assert.ok(Number((maintenance.storage as Metadata).used) > 0); assert.equal(maintenance.cleanupAutomatic, false);
+      const backup = await admin.rpc('maintenance.backup'); assert.match(String(backup.meta.id), /^backup-[0-9a-f-]{36}$/);
+      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota, delivery, backupId: String(backup.meta.id) };
+      checks.push('Global storage and audit status are admin-only; quiescent backup completed without granting file access');
       writeFileSync(statePath, JSON.stringify(state, null, 2));
       checks.push('Upload/download SHA-256 and cross-user access denial', 'Persistent partial upload and independent audit checkpoint prepared');
     } else {
@@ -217,12 +222,15 @@ export async function checkContainer(options: ContainerCheckOptions) {
       await assert.rejects(bob.rpc('download.init', { fileId: state.fileId, deliveryId: state.delivery.revoked }), /DELIVERY_UNAVAILABLE/);
       assert.deepEqual((await bob.rpc('storage.usage')).meta, state.delivery.recipientQuota);
       checks.push('Active/revoked delivery grants survive restart and recipient quota remains unchanged');
+      const maintenance = (await admin.rpc('maintenance.status')).meta;
+      assert.ok((maintenance.backups as { id: string }[]).some(b => b.id === state.backupId));
+      checks.push('Maintenance policy and verified backup metadata survive restart');
       checks.push('Disabled account, deleted key and consumed invitation stay invalid across restart');
       checks.push('Generated accounts, completed file, renamed filename and quota values survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');
     }
     assert.equal((await peer.rpc('hello')).meta.connection, connection);
     checks.push('The WSS connection is reused across file operations');
-    return { version: 5, phase, ok: true, checks };
+    return { version: 6, phase, ok: true, checks };
   } finally { for (const peer of peers) peer.close(); }
 }
 

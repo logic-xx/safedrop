@@ -129,6 +129,19 @@ try {
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-profile.json'), ($profile | ConvertTo-Json -Depth 4), $utf8)
     & node 'node_modules/tsx/dist/cli.mjs' 'tests/container-smoke.ts' seed $privateDir
     if ($LASTEXITCODE -ne 0) { throw 'HTTPS/WSS transfer checks failed before restart.' }
+    # The host keeps an independent checkpoint and restores only into a fresh private directory.
+    $maintenanceState = Get-Content -LiteralPath (Join-Path $privateDir 'state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Condition ($maintenanceState.backupId -match '^backup-[0-9a-f-]{36}$') 'Invalid backup identifier.'
+    $backupPath = Join-Path $privateDir $maintenanceState.backupId
+    Assert-Condition (-not (Test-Path -LiteralPath $backupPath)) 'The verification backup destination already exists.'
+    Invoke-DockerChecked @composeArgs cp ("app:/data/store.backups/" + $maintenanceState.backupId) $backupPath
+    $checkpointPath = Join-Path $privateDir 'maintenance-checkpoint.json'
+    [IO.File]::WriteAllText($checkpointPath, ($maintenanceState.checkpoint | ConvertTo-Json), $utf8)
+    & node 'node_modules/tsx/dist/cli.mjs' 'scripts/maintenance.ts' verify --source $backupPath --anchor $checkpointPath
+    if ($LASTEXITCODE -ne 0) { throw 'Copied backup failed integrity or independent checkpoint verification.' }
+    $restorePath = Join-Path $privateDir ('restore-' + [Guid]::NewGuid().ToString())
+    & node 'node_modules/tsx/dist/cli.mjs' 'scripts/maintenance.ts' restore --source $backupPath --target $restorePath --anchor $checkpointPath
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated restore failed. Existing verification data remains unchanged.' }
     Write-Host 'Restarting the verification containers while retaining their data volumes ...'
     Invoke-DockerChecked @composeArgs restart app gateway
     & node 'node_modules/tsx/dist/cli.mjs' 'tests/container-smoke.ts' resume $privateDir
@@ -137,7 +150,7 @@ try {
     Invoke-DockerChecked @composeArgs cp 'gateway:/data/caddy/pki/authorities/local/root.crt' (Join-Path $privateDir 'ca-after.crt')
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts-after.json') -Algorithm SHA256).Hash -eq $accountsHash) 'Generated credentials changed after restart.'
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'ca-after.crt') -Algorithm SHA256).Hash -eq $caHash) 'The gateway CA changed after restart.'
-    $summary = [ordered]@{ version = 5; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true }
+    $summary = [ordered]@{ version = 6; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true } }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'
