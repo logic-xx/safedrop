@@ -39,7 +39,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
     // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
     const version = this.get('PRAGMA user_version')!.user_version;
-    need(version <= 2, 'DATABASE_VERSION_UNSUPPORTED');
+    need(version <= 3, 'DATABASE_VERSION_UNSUPPORTED');
     if (version < 1) this.transaction(() => {
       this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
@@ -52,6 +52,13 @@ export class Store {
     if (version < 2) this.transaction(() => {
       this.db.exec(`CREATE TABLE deletions(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('files','transfers')),userId TEXT NOT NULL,created INTEGER NOT NULL);
         PRAGMA user_version=2;`);
+    });
+    if (version < 3) this.transaction(() => {
+      this.db.exec(`CREATE TABLE deliveries(id TEXT PRIMARY KEY,fileId TEXT NOT NULL,ownerId TEXT NOT NULL,recipientId TEXT NOT NULL,name TEXT NOT NULL,created INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,revokedAt INTEGER,reason TEXT);
+        CREATE UNIQUE INDEX deliveries_active_pair ON deliveries(fileId,recipientId) WHERE revoked=0;
+        CREATE INDEX deliveries_recipient ON deliveries(recipientId,created DESC,id DESC);
+        CREATE INDEX deliveries_owner ON deliveries(ownerId,created DESC,id DESC);
+        PRAGMA user_version=3;`);
     });
   }
   get(sql: string, ...args: any[]): Row | undefined { return this.db.prepare(sql).get(...args) as Row | undefined; }

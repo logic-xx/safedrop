@@ -12,7 +12,8 @@ import { digest, type Checkpoint } from '../server/store.ts';
 
 type Account = { name: string; password: string };
 type AccountState = { userId: string; name: string; password: string; token: string; keyId: string };
-type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata };
+type DeliveryState = { active: string; revoked: string; recipientQuota: Metadata };
+type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata; delivery: DeliveryState };
 export interface ContainerCheckOptions { origin: string; ca: Buffer; accounts: Account[]; statePath: string; phase: 'seed' | 'resume' }
 
 class Peer {
@@ -71,10 +72,11 @@ export async function checkContainer(options: ContainerCheckOptions) {
     const account = accounts.find(account => account.name === name); assert.ok(account, `Missing generated account: ${name}`);
     const peer = await connect(); await peer.rpc('auth.password', { name, password: account.password }); return peer;
   };
-  const download = async (peer: Peer, fileId: string) => {
-    const info = (await peer.rpc('download.init', { fileId, offset: 0 })).meta, blocks: Buffer[] = [];
+  const download = async (peer: Peer, fileId: string, deliveryId?: string) => {
+    const access = { fileId, ...(deliveryId ? { deliveryId } : {}) };
+    const info = (await peer.rpc('download.init', { ...access, offset: 0 })).meta, blocks: Buffer[] = [];
     for (let offset = 0; offset < Number(info.size);) {
-      const frame = await peer.rpc('download.chunk', { fileId, offset });
+      const frame = await peer.rpc('download.chunk', { ...access, offset });
       assert.equal(frame.meta.offset, offset); assert.ok(frame.payload.length > 0);
       offset += frame.payload.length; assert.equal(frame.meta.next, offset); blocks.push(Buffer.from(frame.payload));
     }
@@ -139,6 +141,23 @@ export async function checkContainer(options: ContainerCheckOptions) {
       return { userId: user.id, name, password, token, keyId };
     } finally { if (policy === 'closed') await admin.rpc('registration.set', { mode: 'closed' }); }
   };
+  const deliveryCheck = async (owner: Peer, recipient: Peer, outsider: Peer, fileId: string, bytes: Buffer): Promise<DeliveryState> => {
+    const before = (await owner.rpc('storage.usage')).meta, recipientQuota = (await recipient.rpc('storage.usage')).meta;
+    assert.deepEqual((await owner.rpc('deliveries.prepare', { fileId, recipient: 'bob' })).meta.recipient, { name: 'bob' });
+    const revoked = String((await owner.rpc('deliveries.create', { fileId, recipient: 'bob' })).meta.deliveryId);
+    assert.equal(await download(recipient, fileId, revoked), digest(bytes));
+    await recipient.rpc('download.init', { fileId, deliveryId: revoked, offset: CHUNK, prefixHash: digest(bytes.subarray(0, CHUNK)) });
+    await assert.rejects(recipient.rpc('files.delete', { fileId }), /NOT_FOUND/);
+    await assert.rejects(recipient.rpc('deliveries.create', { fileId, recipient: 'alice' }), /NOT_FOUND/);
+    await assert.rejects(outsider.rpc('download.chunk', { fileId, deliveryId: revoked, offset: 0 }), /NOT_FOUND/);
+    await owner.rpc('deliveries.revoke', { deliveryId: revoked });
+    await assert.rejects(recipient.rpc('download.init', { fileId, deliveryId: revoked }), /DELIVERY_UNAVAILABLE/);
+    const active = String((await owner.rpc('deliveries.create', { fileId, recipient: 'bob' })).meta.deliveryId); assert.notEqual(active, revoked);
+    await assert.rejects(recipient.rpc('download.chunk', { fileId, deliveryId: revoked, offset: 0 }), /DELIVERY_UNAVAILABLE/);
+    assert.deepEqual((await owner.rpc('storage.usage')).meta, before); assert.deepEqual((await recipient.rpc('storage.usage')).meta, recipientQuota);
+    checks.push('Controlled delivery download/resume SHA-256, read-only recipient and unrelated/admin denial', 'Revocation and resend keep old grants invalid; storage is charged once to the owner');
+    return { active, revoked, recipientQuota };
+  };
   try {
     let ready = false;
     for (let i = 0; i < 40; i++) {
@@ -168,10 +187,11 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const bob = await login('bob'); await assert.rejects(bob.rpc('download.init', { fileId, offset: 0 }), /NOT_FOUND/);
       const partial = await peer.rpc('upload.init', { name: name + '-resume.bin', size: bytes.length, sha256 });
       assert.equal((await peer.rpc('upload.chunk', { transferId: partial.meta.id, offset: 0 }, bytes.subarray(0, CHUNK))).meta.offset, CHUNK);
-      const admin = await login('admin'), account = await accountCheck(admin, seed.slice(0, 12)), checkpoint = (await admin.rpc('audit.page')).meta.checkpoint as unknown as Checkpoint;
+      const admin = await login('admin'), account = await accountCheck(admin, seed.slice(0, 12));
+      const delivery = await deliveryCheck(peer, bob, admin, fileId, bytes), checkpoint = (await admin.rpc('audit.page')).meta.checkpoint as unknown as Checkpoint;
       // This ignored, private state contains only disposable check credentials, never print it.
       const quota = (await peer.rpc('storage.usage')).meta;
-      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota };
+      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota, delivery };
       writeFileSync(statePath, JSON.stringify(state, null, 2));
       checks.push('Upload/download SHA-256 and cross-user access denial', 'Persistent partial upload and independent audit checkpoint prepared');
     } else {
@@ -192,12 +212,17 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const denied = await connect(); await assert.rejects(denied.rpc('auth.password', { name: account.name, password: account.password }), /INVALID_CREDENTIALS/);
       await assert.rejects(denied.rpc('auth.challenge', { name: account.name, keyId: account.keyId }), /INVALID_CREDENTIALS/);
       if ((await admin.rpc('hello')).meta.registration === 'invitation') await assert.rejects(denied.rpc('auth.register', { token: account.token, name: account.name + '-again', password: account.password }), /INVITATION_INVALID/);
+      const bob = await login('bob'); assert.ok(state.delivery, 'Expected controlled-delivery state');
+      assert.equal(await download(bob, state.fileId, state.delivery.active), state.sha256);
+      await assert.rejects(bob.rpc('download.init', { fileId: state.fileId, deliveryId: state.delivery.revoked }), /DELIVERY_UNAVAILABLE/);
+      assert.deepEqual((await bob.rpc('storage.usage')).meta, state.delivery.recipientQuota);
+      checks.push('Active/revoked delivery grants survive restart and recipient quota remains unchanged');
       checks.push('Disabled account, deleted key and consumed invitation stay invalid across restart');
       checks.push('Generated accounts, completed file, renamed filename and quota values survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');
     }
     assert.equal((await peer.rpc('hello')).meta.connection, connection);
     checks.push('The WSS connection is reused across file operations');
-    return { version: 4, phase, ok: true, checks };
+    return { version: 5, phase, ok: true, checks };
   } finally { for (const peer of peers) peer.close(); }
 }
 

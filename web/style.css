@@ -7,3 +7,5 @@
 .form-error{width:100%;padding:15px 17px;border:1px solid #d7a29a;border-left:4px solid #b84638;background:#fff2ef;color:#93392e;border-radius:8px;scroll-margin:24px}.form-error strong{font-size:14px}.form-error p{margin-top:6px}.form-error:focus{outline:3px solid #e5b9b2;outline-offset:3px}
 
 .quota-summary{display:flex;flex-wrap:wrap;gap:12px 24px;margin:-6px 0 24px;color:#7b8796;font-size:11px;line-height:1.8}.file-buttons{display:flex;align-items:center;gap:15px;min-height:78px}.file-action{scroll-margin:24px}.action-filename{overflow-wrap:anywhere;font-weight:600}.delete-button{background:#aa4038;border-color:#aa4038}.quota-summary+.form-error{margin-bottom:20px}
+
+.delivery-recipient{display:flex;align-items:flex-end;gap:15px;flex-wrap:wrap;width:100%}.delivery-recipient label{max-width:360px}.recipient-confirm{display:flex;flex-direction:column;align-items:flex-start;gap:16px;padding:18px;border:1px solid #d9e8e1;border-radius:8px;background:#f6faf8;width:100%}.check-label{flex-direction:row;align-items:center;font-weight:400}.check-label input{width:17px;height:17px;accent-color:#147d65}
