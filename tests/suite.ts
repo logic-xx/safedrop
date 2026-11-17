@@ -10,7 +10,7 @@ import { digest, verifyAudit, type Row } from '../server/store.ts';
 import { encode, decode, CHUNK, MAX_FRAME, type Metadata, type Frame } from '../shared/protocol.ts';
 import { certificates } from '../scripts/certificates.ts';
 
-class Peer {
+export class Peer {
   seq = 0; pending = new Map<number, { yes: (f: Frame) => void; no: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   constructor(public ws: WebSocket) {
     ws.on('message', data => { const f = decode(Buffer.from(data as Buffer)); const p = this.pending.get(f.requestId); if (p) { clearTimeout(p.timer); this.pending.delete(f.requestId); f.meta.ok ? p.yes(f) : p.no(new Error(String(f.meta.code))); } });

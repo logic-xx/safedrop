@@ -9,6 +9,7 @@ export function need(ok: unknown, code: string): asserts ok { if (!ok) throw new
 export function text(v: unknown, max = 180): string { need(typeof v === 'string' && v.length > 0 && v.length <= max, 'INVALID_INPUT'); return v; }
 export function integer(v: unknown, max = Number.MAX_SAFE_INTEGER): number { need(Number.isSafeInteger(v) && Number(v) >= 0 && Number(v) <= max, 'INVALID_INTEGER'); return Number(v); }
 export const id = () => randomUUID();
+export function validAccount(name: string, pass: string) { need(/^[a-zA-Z0-9_-]{3,32}$/.test(name) && pass.length >= 12 && pass.length <= 256, 'INVALID_USER'); }
 const derive = (pass: string, salt: string) => new Promise<Buffer>((resolve, reject) => rawScrypt(pass, salt, 32, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 ** 2 }, (e, key) => e ? reject(e) : resolve(key)));
 export async function passwordHash(pass: string) { const salt = randomBytes(16).toString('hex'); return `${salt}:${(await derive(pass, salt)).toString('hex')}`; }
 export async function passwordCheck(pass: string, hash: string) { const [salt, hex] = hash.split(':'); const actual = await derive(pass, salt); return timingSafeEqual(actual, Buffer.from(hex, 'hex')); }
@@ -36,13 +37,31 @@ export class Store {
       CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,userId TEXT NOT NULL,name TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS transfers(id TEXT PRIMARY KEY,userId TEXT NOT NULL,name TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,offset INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
+    // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
+    const version = this.get('PRAGMA user_version')!.user_version;
+    need(version <= 1, 'DATABASE_VERSION_UNSUPPORTED');
+    if (version < 1) this.transaction(() => {
+      this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE invitations(id TEXT PRIMARY KEY,tokenHash TEXT UNIQUE NOT NULL,createdBy TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL,usedBy TEXT,usedAt INTEGER,revoked INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        INSERT INTO settings VALUES('registration','invitation');
+        CREATE INDEX invitations_created ON invitations(created DESC,id DESC);
+        PRAGMA user_version=1;`);
+    });
   }
   get(sql: string, ...args: any[]): Row | undefined { return this.db.prepare(sql).get(...args) as Row | undefined; }
   all(sql: string, ...args: any[]): Row[] { return this.db.prepare(sql).all(...args) as Row[]; }
   run(sql: string, ...args: any[]) { return this.db.prepare(sql).run(...args); }
+  transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try { const result = fn(); this.db.exec('COMMIT'); return result; }
+    catch (e) { this.db.exec('ROLLBACK'); throw e; }
+  }
+  registration() { return this.get("SELECT value FROM settings WHERE key='registration'")!.value as string; }
   async addUser(name: string, password: string, role = 'user', tier = 'normal') {
-    need(/^[a-zA-Z0-9_-]{3,32}$/.test(name) && password.length >= 12 && password.length <= 256, 'INVALID_USER');
-    const userId = id(); this.run('INSERT INTO users VALUES(?,?,?,?,?)', userId, name, await passwordHash(password), role, tier); return userId;
+    validAccount(name, password);
+    const userId = id(); this.run('INSERT INTO users(id,name,hash,role,tier) VALUES(?,?,?,?,?)', userId, name, await passwordHash(password), role, tier); return userId;
   }
   audit(user: string, action: string, result: string, detail: Record<string, unknown> = {}) {
     const event = JSON.stringify({ time: new Date().toISOString(), user, action, result, detail });

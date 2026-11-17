@@ -44,10 +44,34 @@ try {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
+    $snapshotSource = Get-Content -LiteralPath 'scripts/data-snapshot.mjs' -Raw -Encoding UTF8
+    $existingSnapshot = $null
+    $existingApp = (Invoke-DockerChecked @composeArgs ps --quiet app)
+    if ($existingApp) {
+        # Runs against the old image too: the source uses only built-in Node modules.
+        # Capture only row fingerprints; no password hashes, names or tokens are printed.
+        $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module', '--eval', $snapshotSource)
+        $existingSnapshot = (Invoke-DockerChecked -DockerArgs $snapshotArgs | ConvertFrom-Json)
+    }
     Write-Host 'Building and starting isolated project safedrop-check on https://localhost:18443 ...'
     # Mounted Caddyfile changes require a new process even if its path is stable.
     # Recreating these verification containers preserves their named data volumes.
     Invoke-DockerChecked @composeArgs up --build --force-recreate --detach --wait --wait-timeout 180
+    $existingData = [ordered]@{ checked = $false; records = 0 }
+    if ($null -ne $existingSnapshot) {
+        $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module', '--eval', $snapshotSource)
+        $upgradedSnapshot = (Invoke-DockerChecked -DockerArgs $snapshotArgs | ConvertFrom-Json)
+        foreach ($table in $existingSnapshot.tables.PSObject.Properties) {
+            $upgradedTable = $upgradedSnapshot.tables.PSObject.Properties[$table.Name].Value
+            foreach ($record in $table.Value.PSObject.Properties) {
+                $upgradedRecord = $upgradedTable.PSObject.Properties[$record.Name]
+                Assert-Condition ($null -ne $upgradedRecord -and $upgradedRecord.Value -eq $record.Value) "Existing $($table.Name) data changed during upgrade. Stop and inspect the retained data volume."
+                $existingData.records++
+            }
+        }
+        $existingData.checked = $true
+        Write-Host "PASS upgrade preserved $($existingData.records) existing database records (session revocation on restart is expected)."
+    }
     $certificateReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         # Caddy creates its local CA during first startup. Copy only the public CA.
@@ -106,7 +130,7 @@ try {
     Invoke-DockerChecked @composeArgs cp 'gateway:/data/caddy/pki/authorities/local/root.crt' (Join-Path $privateDir 'ca-after.crt')
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts-after.json') -Algorithm SHA256).Hash -eq $accountsHash) 'Generated credentials changed after restart.'
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'ca-after.crt') -Algorithm SHA256).Hash -eq $caHash) 'The gateway CA changed after restart.'
-    $summary = [ordered]@{ version = 2; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true }
+    $summary = [ordered]@{ version = 3; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

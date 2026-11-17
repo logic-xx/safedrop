@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, generateKeyPairSync, sign } from 'node:crypto';
 import { once } from 'node:events';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { request } from 'node:https';
@@ -11,7 +11,8 @@ import { CHUNK, encode, decode, type Frame, type Metadata } from '../shared/prot
 import { digest, type Checkpoint } from '../server/store.ts';
 
 type Account = { name: string; password: string };
-type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint };
+type AccountState = { userId: string; name: string; password: string; token: string; keyId: string };
+type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState };
 export interface ContainerCheckOptions { origin: string; ca: Buffer; accounts: Account[]; statePath: string; phase: 'seed' | 'resume' }
 
 class Peer {
@@ -86,6 +87,38 @@ export async function checkContainer(options: ContainerCheckOptions) {
     }
     return String((await peer.rpc('upload.finish', { transferId })).meta.fileId);
   };
+  const findUser = async (admin: Peer, name: string) => {
+    for (let offset = 0; offset <= 10000; offset += 12) {
+      const users = (await admin.rpc('users.list', { offset })).meta.users as Array<{ id: string; name: string; disabled: number }>;
+      const user = users.find(u => u.name === name); if (user) return user; if (users.length < 12) break;
+    }
+    throw new Error('Account check user not found');
+  };
+  const accountCheck = async (admin: Peer, suffix: string): Promise<AccountState> => {
+    const policy = String((await admin.rpc('hello')).meta.registration); assert.ok(['invitation', 'closed'].includes(policy), 'Account policy module is missing');
+    const name = 'check-' + suffix, password = randomBytes(24).toString('base64url'), oldPassword = randomBytes(24).toString('base64url');
+    if (policy === 'closed') await admin.rpc('registration.set', { mode: 'invitation' });
+    try {
+      const token = String((await admin.rpc('invitations.create', { hours: 1 })).meta.token), peer = await connect();
+      await peer.rpc('auth.register', { token, name, password: oldPassword });
+      await assert.rejects(peer.rpc('auth.register', { token, name: name + '-replay', password: oldPassword }), /INVITATION_INVALID/);
+      await peer.rpc('auth.password', { name, password: oldPassword });
+      await assert.rejects(peer.rpc('users.disable', { userId: 'unknown' }), /FORBIDDEN/);
+      const closed = once(peer.ws, 'close'); await peer.rpc('account.password', { password: oldPassword, newPassword: password }); await closed;
+      const active = await connect(); await assert.rejects(active.rpc('auth.password', { name, password: oldPassword }), /INVALID_CREDENTIALS/);
+      await active.rpc('auth.password', { name, password });
+      const pair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      const keyId = String((await active.rpc('keys.enroll', { password, label: 'container-account-check', jwk: pair.publicKey.export({ format: 'jwk' }) })).meta.keyId);
+      const keyed = await connect(), challenge = String((await keyed.rpc('auth.challenge', { name, keyId })).meta.message);
+      await keyed.rpc('auth.prove', { signature: sign('sha256', Buffer.from(challenge), { key: pair.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64') });
+      const user = await findUser(admin, name), closures = [active, keyed].map(p => once(p.ws, 'close'));
+      await admin.rpc('users.disable', { userId: user.id }); await Promise.all(closures);
+      const denied = await connect(); await assert.rejects(denied.rpc('auth.password', { name, password }), /INVALID_CREDENTIALS/);
+      await assert.rejects(denied.rpc('auth.challenge', { name, keyId }), /INVALID_CREDENTIALS/);
+      checks.push('Invitation registration/replay denial, ordinary-user admin denial, password rotation and all-session revocation', 'Disabled account rejects password/public-key authentication and closes both session types');
+      return { userId: user.id, name, password, token, keyId };
+    } finally { if (policy === 'closed') await admin.rpc('registration.set', { mode: 'closed' }); }
+  };
   try {
     let ready = false;
     for (let i = 0; i < 40; i++) {
@@ -114,8 +147,9 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const bob = await login('bob'); await assert.rejects(bob.rpc('download.init', { fileId, offset: 0 }), /NOT_FOUND/);
       const partial = await peer.rpc('upload.init', { name: name + '-resume.bin', size: bytes.length, sha256 });
       assert.equal((await peer.rpc('upload.chunk', { transferId: partial.meta.id, offset: 0 }, bytes.subarray(0, CHUNK))).meta.offset, CHUNK);
-      const admin = await login('admin'), checkpoint = (await admin.rpc('audit.page')).meta.checkpoint as unknown as Checkpoint;
-      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint };
+      const admin = await login('admin'), account = await accountCheck(admin, seed.slice(0, 12)), checkpoint = (await admin.rpc('audit.page')).meta.checkpoint as unknown as Checkpoint;
+      // This ignored, private state contains only disposable check credentials, never print it.
+      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account };
       writeFileSync(statePath, JSON.stringify(state, null, 2));
       checks.push('Upload/download SHA-256 and cross-user access denial', 'Persistent partial upload and independent audit checkpoint prepared');
     } else {
@@ -127,11 +161,17 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const fileId = await finish(peer, state.transferId, bytes, CHUNK);
       assert.equal(await download(peer, fileId), state.sha256);
       const admin = await login('admin'); assert.equal((await admin.rpc('audit.verify', { checkpoint: state.checkpoint })).meta.ok, true);
+      const account = state.account; assert.ok(account, 'Expected version 3 account check state');
+      const user = await findUser(admin, account.name); assert.equal(user.id, account.userId); assert.equal(user.disabled, 1);
+      const denied = await connect(); await assert.rejects(denied.rpc('auth.password', { name: account.name, password: account.password }), /INVALID_CREDENTIALS/);
+      await assert.rejects(denied.rpc('auth.challenge', { name: account.name, keyId: account.keyId }), /INVALID_CREDENTIALS/);
+      if ((await admin.rpc('hello')).meta.registration === 'invitation') await assert.rejects(denied.rpc('auth.register', { token: account.token, name: account.name + '-again', password: account.password }), /INVITATION_INVALID/);
+      checks.push('Disabled account, deleted key and consumed invitation stay invalid across restart');
       checks.push('Generated accounts and completed file survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');
     }
     assert.equal((await peer.rpc('hello')).meta.connection, connection);
     checks.push('The WSS connection is reused across file operations');
-    return { version: 2, phase, ok: true, checks };
+    return { version: 3, phase, ok: true, checks };
   } finally { for (const peer of peers) peer.close(); }
 }
 

@@ -6,7 +6,7 @@ import { resolve, join, sep, extname } from 'node:path';
 import { createPublicKey, randomBytes, verify } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { CHUNK, MAX_FRAME, encode, decode, type Frame } from '../shared/protocol.ts';
-import { Store, Fault, need, text, integer, id, digest, passwordCheck, verifyAudit, type Row, type Checkpoint } from './store.ts';
+import { Store, Fault, need, text, integer, id, digest, passwordCheck, passwordHash, validAccount, verifyAudit, type Row, type Checkpoint } from './store.ts';
 import { Bandwidth, RateGate } from './limits.ts';
 import { createHash } from 'node:crypto';
 
@@ -24,6 +24,7 @@ export function createApp(config: Config) {
   store.run('UPDATE sessions SET revoked=1 WHERE revoked=0');
   const rate = new RateGate(), bw = new Bandwidth(config.normalRate, config.vipRate);
   const contexts = new Set<Context>(), locks = new Set<string>();
+  const operations = new Set<Promise<void>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
   const root = resolve(config.webRoot ?? 'dist');
   const request = (req: IncomingMessage, res: import('node:http').ServerResponse) => {
@@ -55,11 +56,24 @@ export function createApp(config: Config) {
   function authorized(c: Context) {
     need(!c.abort.signal.aborted && c.user && c.session, 'AUTH_REQUIRED');
     const s = store.get('SELECT * FROM sessions WHERE id=?', c.session);
-    need(s && !s.revoked && s.expires > Date.now(), 'SESSION_EXPIRED'); return c.user!;
+    const u = store.get('SELECT * FROM users WHERE id=?', c.user.id);
+    need(s && !s.revoked && s.expires > Date.now() && u && !u.disabled, 'SESSION_EXPIRED');
+    c.user = u; return u;
   }
   const admin = (c: Context) => need(authorized(c).role === 'admin', 'FORBIDDEN');
+  function stopUser(userId: string, reason: string, replyContext?: Context) {
+    for (const ctx of contexts) {
+      if (ctx.challenge?.key.userId === userId) ctx.challenge = undefined;
+      if (ctx.user?.id !== userId) continue;
+      const stop = () => { ctx.abort.abort(); ctx.ws.close(4001, reason); };
+      // The database is already revoked; allow only this operation's acknowledgement.
+      if (ctx === replyContext) setTimeout(stop, 10); else stop();
+    }
+  }
   function establish(c: Context, u: Row, method: string) {
     need(!c.user, 'ALREADY_AUTHENTICATED');
+    const current = store.get('SELECT * FROM users WHERE id=?', u.id);
+    need(current && !current.disabled && current.authVersion === u.authVersion, 'INVALID_CREDENTIALS');
     need(store.get('SELECT COUNT(*) AS n FROM sessions WHERE userId=? AND revoked=0 AND expires>?', u.id, Date.now())!.n < 8, 'SESSION_LIMIT');
     c.user = u; c.session = id();
     store.run('INSERT INTO sessions VALUES(?,?,?,?,0,?,?)', c.session, u.id, Date.now(), Date.now() + (config.sessionMs ?? 3600000), c.agent, c.ip);
@@ -72,8 +86,33 @@ export function createApp(config: Config) {
     const m = f.meta, op = text(m.op, 64);
     need(f.type === 1 && f.requestId > 0, 'INVALID_REQUEST');
     if (op !== 'upload.chunk') need(f.payload.length === 0, 'UNEXPECTED_PAYLOAD');
-    if (op === 'hello') return { meta: { protocol: 'SFT/1', connection: c.connection, chunkSize: CHUNK, maxFile: config.maxFile ?? 512 * 1024 ** 2, heartbeatSeconds: 20 } };
+    if (op === 'hello') return { meta: { protocol: 'SFT/1', connection: c.connection, chunkSize: CHUNK, maxFile: config.maxFile ?? 512 * 1024 ** 2, heartbeatSeconds: 20, registration: store.registration() } };
     if (op === 'ping') return { meta: { time: Date.now() } };
+    if (op === 'auth.register') {
+      need(!c.user, 'ALREADY_AUTHENTICATED');
+      need(rate.allow('register:' + c.ip, 6) && rate.allow('register:global', 30) && authenticating < 4, 'RATE_LIMITED');
+      need(store.registration() === 'invitation', 'REGISTRATION_CLOSED');
+      const token = text(m.token, 64), name = text(m.name, 32), pass = text(m.password, 256);
+      validAccount(name, pass); need(/^sd1_[A-Za-z0-9_-]{43}$/.test(token), 'INVITATION_INVALID');
+      const tokenHash = digest(token);
+      const usable = () => {
+        need(store.registration() === 'invitation', 'REGISTRATION_CLOSED');
+        const invite = store.get('SELECT * FROM invitations WHERE tokenHash=?', tokenHash);
+        need(invite && !invite.revoked && !invite.usedBy && invite.expires > Date.now(), 'INVITATION_INVALID'); return invite;
+      };
+      usable(); authenticating++;
+      try {
+        const hash = await passwordHash(pass); c.abort.signal.throwIfAborted();
+        const userId = id();
+        store.transaction(() => {
+          const invite = usable(); need(!store.get('SELECT id FROM users WHERE name=?', name), 'ACCOUNT_UNAVAILABLE');
+          store.run("INSERT INTO users(id,name,hash,role,tier) VALUES(?,?,?,'user','normal')", userId, name, hash);
+          store.run('UPDATE invitations SET usedBy=?,usedAt=? WHERE id=?', userId, Date.now(), invite.id);
+          store.audit(name, op, 'allowed', { invitationId: invite.id });
+        });
+        return { meta: { registered: true } };
+      } finally { authenticating--; }
+    }
     if (op === 'auth.password') {
       need(!c.user, 'ALREADY_AUTHENTICATED');
       need(rate.allow('login:' + c.ip, config.loginLimit ?? 10) && authenticating < 4, 'RATE_LIMITED'); authenticating++;
@@ -86,7 +125,7 @@ export function createApp(config: Config) {
     }
     if (op === 'auth.challenge') {
       need(!c.user && rate.allow('challenge:' + c.ip, 30), 'RATE_LIMITED');
-      const key = store.get('SELECT k.*,u.name FROM keys k JOIN users u ON u.id=k.userId WHERE k.id=? AND u.name=?', text(m.keyId, 80), text(m.name, 64));
+      const key = store.get('SELECT k.*,u.name FROM keys k JOIN users u ON u.id=k.userId WHERE k.id=? AND u.name=? AND u.disabled=0', text(m.keyId, 80), text(m.name, 64));
       need(key, 'INVALID_CREDENTIALS'); const expires = Date.now() + 30000;
       const message = JSON.stringify(['SFT/1 AUTH', c.connection, key.name, key.id, randomBytes(32).toString('base64url'), expires]);
       c.challenge = { key, message, expires }; return { meta: { message, expires } };
@@ -100,6 +139,58 @@ export function createApp(config: Config) {
       return { meta: establish(c, store.get('SELECT * FROM users WHERE id=?', challenge.key.userId)!, 'public-key') };
     }
     const u = authorized(c);
+    if (op === 'account.password') {
+      need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED');
+      const oldPass = text(m.password, 256), newPass = text(m.newPassword, 256); validAccount(u.name, newPass);
+      need(oldPass !== newPass, 'PASSWORD_UNCHANGED'); authenticating++;
+      try {
+        need(await passwordCheck(oldPass, u.hash), 'INVALID_CREDENTIALS');
+        const hash = await passwordHash(newPass); authorized(c);
+        store.transaction(() => {
+          need(store.get('SELECT authVersion FROM users WHERE id=?', u.id)!.authVersion === u.authVersion, 'SESSION_EXPIRED');
+          store.run('UPDATE users SET hash=?,authVersion=authVersion+1 WHERE id=?', hash, u.id);
+          store.run('UPDATE sessions SET revoked=1 WHERE userId=?', u.id);
+          store.run('DELETE FROM keys WHERE userId=?', u.id);
+          audit(c, op, 'allowed', { sessions: 'revoked', keys: 'revoked' });
+        });
+        stopUser(u.id, 'PASSWORD_CHANGED', c); return {};
+      } finally { authenticating--; }
+    }
+    if (op === 'registration.set') {
+      admin(c); need(m.mode === 'invitation' || m.mode === 'closed', 'INVALID_INPUT');
+      store.transaction(() => { store.run("UPDATE settings SET value=? WHERE key='registration'", m.mode); audit(c, op, 'allowed', { mode: m.mode }); }); return {};
+    }
+    if (op === 'invitations.create') {
+      admin(c); need(store.registration() === 'invitation', 'REGISTRATION_CLOSED');
+      need(rate.allow('invite-create:' + u.id, 10), 'RATE_LIMITED');
+      const hours = integer(m.hours, 168); need(hours >= 1, 'INVALID_INPUT');
+      need(store.get('SELECT COUNT(*) AS n FROM invitations WHERE usedBy IS NULL AND revoked=0 AND expires>?', Date.now())!.n < 100, 'INVITATION_LIMIT');
+      const inviteId = id(), token = 'sd1_' + randomBytes(32).toString('base64url'), created = Date.now(), expires = created + hours * 3600000;
+      store.transaction(() => { store.run('INSERT INTO invitations(id,tokenHash,createdBy,created,expires) VALUES(?,?,?,?,?)', inviteId, digest(token), u.id, created, expires); audit(c, op, 'allowed', { invitationId: inviteId, expires }); });
+      return { meta: { id: inviteId, token, expires } };
+    }
+    if (op === 'invitations.list') {
+      admin(c); return { meta: { registration: store.registration(), invitations: store.all('SELECT id,created,expires,usedAt,revoked FROM invitations ORDER BY created DESC,id DESC LIMIT 12 OFFSET ?', integer(m.offset ?? 0, 10000)) } };
+    }
+    if (op === 'invitations.revoke') {
+      admin(c); const inviteId = text(m.invitationId, 80); need(store.get('SELECT id FROM invitations WHERE id=?', inviteId), 'NOT_FOUND');
+      store.transaction(() => { store.run('UPDATE invitations SET revoked=1 WHERE id=?', inviteId); audit(c, op, 'allowed', { invitationId: inviteId }); }); return {};
+    }
+    if (op === 'users.list') {
+      admin(c); return { meta: { users: store.all('SELECT id,name,role,tier,disabled FROM users ORDER BY name LIMIT 12 OFFSET ?', integer(m.offset ?? 0, 10000)) } };
+    }
+    if (op === 'users.disable') {
+      admin(c); const userId = text(m.userId, 80);
+      store.transaction(() => {
+        const target = store.get('SELECT * FROM users WHERE id=?', userId); need(target, 'NOT_FOUND');
+        if (!target.disabled && target.role === 'admin') need(store.get("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND disabled=0")!.n > 1, 'LAST_ADMIN');
+        store.run('UPDATE users SET disabled=1,authVersion=authVersion+1 WHERE id=?', userId);
+        store.run('UPDATE sessions SET revoked=1 WHERE userId=?', userId);
+        store.run('DELETE FROM keys WHERE userId=?', userId);
+        audit(c, op, 'allowed', { userId, sessions: 'revoked', keys: 'revoked' });
+      });
+      stopUser(userId, 'ACCOUNT_DISABLED', c); return {};
+    }
     if (op === 'files.list') return { meta: { files: store.all('SELECT id,name,size,sha256,created FROM files WHERE userId=? ORDER BY created DESC,id DESC LIMIT 12 OFFSET ?', u.id, integer(m.offset ?? 0, 10000)) } };
     if (op === 'transfers.list') return { meta: { transfers: store.all('SELECT id,name,size,sha256,offset,created FROM transfers WHERE userId=? ORDER BY created DESC LIMIT 16', u.id) } };
     if (op === 'upload.init') {
@@ -124,22 +215,24 @@ export function createApp(config: Config) {
           await bw.take(u.id, u.tier, f.payload.length, c.abort.signal); authorized(c);
           const h = await open(path, 'r+');
           try {
+            authorized(c);
             if (offset < t.offset) {
               need(offset + f.payload.length <= t.offset, 'INVALID_OFFSET'); const buf = Buffer.alloc(f.payload.length); const { bytesRead } = await h.read(buf, 0, buf.length, offset);
               need(bytesRead === buf.length && buf.equals(Buffer.from(f.payload)), 'CHUNK_CONFLICT');
             } else {
-              let written = 0; while (written < f.payload.length) { const r = await h.write(f.payload, written, f.payload.length - written, offset + written); need(r.bytesWritten > 0, 'WRITE_FAILED'); written += r.bytesWritten; }
-              await h.sync(); store.run('UPDATE transfers SET offset=? WHERE id=?', offset + written, t.id); t.offset = offset + written;
+              let written = 0; while (written < f.payload.length) { authorized(c); const r = await h.write(f.payload, written, f.payload.length - written, offset + written); need(r.bytesWritten > 0, 'WRITE_FAILED'); written += r.bytesWritten; }
+              await h.sync(); authorized(c); store.run('UPDATE transfers SET offset=? WHERE id=?', offset + written, t.id); t.offset = offset + written;
             }
           } finally { await h.close(); }
           return { meta: { offset: t.offset } };
         }
-        if (op === 'upload.cancel') { await unlink(path).catch(() => {}); store.run('DELETE FROM transfers WHERE id=?', t.id); audit(c, op, 'allowed', { transferId: t.id }); return {}; }
+        if (op === 'upload.cancel') { await unlink(path).catch(() => {}); authorized(c); store.run('DELETE FROM transfers WHERE id=?', t.id); audit(c, op, 'allowed', { transferId: t.id }); return {}; }
         need(t.offset === t.size, 'INCOMPLETE_FILE'); need(hashing < 4, 'SERVER_BUSY'); hashing++;
         try {
           const final = join(config.root, 'objects', t.id), source = existsSync(path) ? path : final;
           need((await stat(source)).size === t.size && await hashFile(source) === t.sha256, 'HASH_MISMATCH'); authorized(c);
           if (source !== final) await rename(path, final);
+          authorized(c);
           store.db.exec('BEGIN IMMEDIATE');
           try { store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', t.id, u.id, t.name, t.size, t.sha256, Date.now()); store.run('DELETE FROM transfers WHERE id=?', t.id); store.db.exec('COMMIT'); } catch (e) { store.db.exec('ROLLBACK'); throw e; }
           audit(c, op, 'allowed', { fileId: t.id, size: t.size, sha256: t.sha256 }); return { meta: { fileId: t.id, sha256: t.sha256 } };
@@ -170,7 +263,7 @@ export function createApp(config: Config) {
     if (op === 'keys.enroll' || op === 'keys.revoke') {
       need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED'); authenticating++;
       try { need(await passwordCheck(text(m.password, 256), u.hash), 'INVALID_CREDENTIALS'); } finally { authenticating--; }
-      authorized(c);
+      need(authorized(c).authVersion === u.authVersion, 'SESSION_EXPIRED');
       if (op === 'keys.revoke') { need(store.get('SELECT id FROM keys WHERE id=? AND userId=?', text(m.keyId, 80), u.id), 'NOT_FOUND'); store.run('DELETE FROM keys WHERE id=?', m.keyId); audit(c, op, 'allowed'); return {}; }
       need(store.get('SELECT COUNT(*) AS n FROM keys WHERE userId=?', u.id)!.n < 5, 'KEY_LIMIT');
       need(m.jwk && typeof m.jwk === 'object', 'INVALID_KEY'); const j = m.jwk as Row;
@@ -208,6 +301,7 @@ export function createApp(config: Config) {
           else ws.close(4002, 'INVALID_FRAME');
         } finally { c.pending--; queuedBytes -= bytes.length; }
       }).catch(() => { ws.terminate(); });
+      const work = queue; operations.add(work); void work.then(() => operations.delete(work));
     });
     ws.on('error', () => { /* Peer protocol violations must not crash the server. */ });
     ws.on('close', () => { clearTimeout(authDeadline); c.abort.abort(); contexts.delete(c); if (c.session) try { store.run('UPDATE sessions SET revoked=1 WHERE id=?', c.session); } catch { /* The connection is already invalid; a storage failure must not escape this event handler. */ } });
@@ -220,5 +314,5 @@ export function createApp(config: Config) {
     }
   }, 20000); heartbeat.unref();
   store.audit('system', 'server.start', 'allowed', { protocol: 'SFT/1' });
-  return { server, store, bw, async close() { clearInterval(heartbeat); for (const c of contexts) c.ws.terminate(); await new Promise<void>(r => wss.close(() => r())); await new Promise<void>(r => server.close(() => r())); store.close(); } };
+  return { server, store, bw, async close() { clearInterval(heartbeat); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
 }

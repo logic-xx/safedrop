@@ -1,6 +1,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { runSuite } from '../tests/suite.ts';
+import { runAccountSuite } from '../tests/accounts-suite.ts';
 const report = await runSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`));
+report.results.push(...await runAccountSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
+report.passed = report.results.filter(r => r.ok).length;
 mkdirSync('reports', { recursive: true });
 writeFileSync('reports/latest.json', JSON.stringify(report, null, 2));
 const esc = (s: string) => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
