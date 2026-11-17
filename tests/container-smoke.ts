@@ -12,7 +12,7 @@ import { digest, type Checkpoint } from '../server/store.ts';
 
 type Account = { name: string; password: string };
 type AccountState = { userId: string; name: string; password: string; token: string; keyId: string };
-type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState };
+type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata };
 export interface ContainerCheckOptions { origin: string; ca: Buffer; accounts: Account[]; statePath: string; phase: 'seed' | 'resume' }
 
 class Peer {
@@ -94,6 +94,25 @@ export async function checkContainer(options: ContainerCheckOptions) {
     }
     throw new Error('Account check user not found');
   };
+  const fileManagementCheck = async (owner: Peer, outsider: Peer, suffix: string) => {
+    const before = (await owner.rpc('storage.usage')).meta, bytes = randomBytes(73), name = 'file-check-' + suffix;
+    const transferId = String((await owner.rpc('upload.init', { name: name + '.bin', size: bytes.length, sha256: digest(bytes) })).meta.id);
+    assert.equal((await owner.rpc('storage.usage')).meta.reserved, Number(before.reserved) + bytes.length);
+    const fileId = await finish(owner, transferId, bytes), renamed = name + '-改名.bin';
+    const file = (await owner.rpc('files.rename', { fileId, name: renamed })).meta.file as Record<string, unknown>;
+    assert.equal(file.id, fileId); assert.equal(file.name, renamed); assert.equal(file.sha256, digest(bytes));
+    assert.equal((await owner.rpc('download.init', { fileId, offset: 17, prefixHash: digest(bytes.subarray(0, 17)) })).meta.name, renamed);
+    assert.equal(digest((await owner.rpc('download.chunk', { fileId, offset: 17 })).payload), digest(bytes.subarray(17)));
+    await assert.rejects(outsider.rpc('files.rename', { fileId, name: 'forbidden.bin' }), /NOT_FOUND/);
+    await assert.rejects(outsider.rpc('files.delete', { fileId }), /NOT_FOUND/);
+    assert.equal((await owner.rpc('storage.usage')).meta.used, Number(before.used) + bytes.length);
+    await owner.rpc('files.delete', { fileId }); await assert.rejects(owner.rpc('download.init', { fileId }), /NOT_FOUND/);
+    const partial = String((await owner.rpc('upload.init', { name: name + '-cancel.bin', size: bytes.length, sha256: digest(bytes) })).meta.id);
+    await owner.rpc('upload.chunk', { transferId: partial, offset: 0 }, bytes.subarray(0, 17));
+    await owner.rpc('upload.cancel', { transferId: partial });
+    assert.deepEqual((await owner.rpc('storage.usage')).meta, before);
+    checks.push('Rename preserves file identity/content and resumability; cross-user/admin mutations are denied', 'Permanent deletion and partial-upload cancellation restore exact server quota values');
+  };
   const accountCheck = async (admin: Peer, suffix: string): Promise<AccountState> => {
     const policy = String((await admin.rpc('hello')).meta.registration); assert.ok(['invitation', 'closed'].includes(policy), 'Account policy module is missing');
     const name = 'check-' + suffix, password = randomBytes(24).toString('base64url'), oldPassword = randomBytes(24).toString('base64url');
@@ -109,6 +128,7 @@ export async function checkContainer(options: ContainerCheckOptions) {
       await active.rpc('auth.password', { name, password });
       const pair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
       const keyId = String((await active.rpc('keys.enroll', { password, label: 'container-account-check', jwk: pair.publicKey.export({ format: 'jwk' }) })).meta.keyId);
+      await fileManagementCheck(active, admin, suffix);
       const keyed = await connect(), challenge = String((await keyed.rpc('auth.challenge', { name, keyId })).meta.message);
       await keyed.rpc('auth.prove', { signature: sign('sha256', Buffer.from(challenge), { key: pair.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64') });
       const user = await findUser(admin, name), closures = [active, keyed].map(p => once(p.ws, 'close'));
@@ -143,22 +163,28 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const seed = randomBytes(32).toString('hex'), bytes = payload(seed), sha256 = digest(bytes), name = `container-check-${seed.slice(0, 12)}`;
       const complete = await peer.rpc('upload.init', { name: name + '.bin', size: bytes.length, sha256 });
       const fileId = await finish(peer, String(complete.meta.id), bytes);
+      await peer.rpc('files.rename', { fileId, name: name + '-renamed.bin' });
       assert.equal(await download(peer, fileId), sha256);
       const bob = await login('bob'); await assert.rejects(bob.rpc('download.init', { fileId, offset: 0 }), /NOT_FOUND/);
       const partial = await peer.rpc('upload.init', { name: name + '-resume.bin', size: bytes.length, sha256 });
       assert.equal((await peer.rpc('upload.chunk', { transferId: partial.meta.id, offset: 0 }, bytes.subarray(0, CHUNK))).meta.offset, CHUNK);
       const admin = await login('admin'), account = await accountCheck(admin, seed.slice(0, 12)), checkpoint = (await admin.rpc('audit.page')).meta.checkpoint as unknown as Checkpoint;
       // This ignored, private state contains only disposable check credentials, never print it.
-      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account };
+      const quota = (await peer.rpc('storage.usage')).meta;
+      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota };
       writeFileSync(statePath, JSON.stringify(state, null, 2));
       checks.push('Upload/download SHA-256 and cross-user access denial', 'Persistent partial upload and independent audit checkpoint prepared');
     } else {
       const state: State = JSON.parse(readFileSync(statePath, 'utf8')), bytes = payload(state.seed);
       assert.equal((await peer.rpc('files.list')).meta.files instanceof Array, true);
+      assert.deepEqual((await peer.rpc('storage.usage')).meta, state.quota);
       assert.equal(await download(peer, state.fileId), state.sha256);
+      assert.equal((await peer.rpc('download.init', { fileId: state.fileId })).meta.name, state.name + '-renamed.bin');
       const resumed = await peer.rpc('upload.init', { transferId: state.transferId, name: state.name + '-resume.bin', size: bytes.length, sha256: state.sha256 });
       assert.equal(resumed.meta.offset, CHUNK, 'Confirmed upload offset was not preserved');
       const fileId = await finish(peer, state.transferId, bytes, CHUNK);
+      const quota = (await peer.rpc('storage.usage')).meta;
+      assert.equal(quota.used, Number(state.quota.used) + bytes.length); assert.equal(quota.reserved, Number(state.quota.reserved) - bytes.length); assert.equal(quota.available, state.quota.available);
       assert.equal(await download(peer, fileId), state.sha256);
       const admin = await login('admin'); assert.equal((await admin.rpc('audit.verify', { checkpoint: state.checkpoint })).meta.ok, true);
       const account = state.account; assert.ok(account, 'Expected version 3 account check state');
@@ -167,11 +193,11 @@ export async function checkContainer(options: ContainerCheckOptions) {
       await assert.rejects(denied.rpc('auth.challenge', { name: account.name, keyId: account.keyId }), /INVALID_CREDENTIALS/);
       if ((await admin.rpc('hello')).meta.registration === 'invitation') await assert.rejects(denied.rpc('auth.register', { token: account.token, name: account.name + '-again', password: account.password }), /INVITATION_INVALID/);
       checks.push('Disabled account, deleted key and consumed invitation stay invalid across restart');
-      checks.push('Generated accounts and completed file survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');
+      checks.push('Generated accounts, completed file, renamed filename and quota values survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');
     }
     assert.equal((await peer.rpc('hello')).meta.connection, connection);
     checks.push('The WSS connection is reused across file operations');
-    return { version: 3, phase, ok: true, checks };
+    return { version: 4, phase, ok: true, checks };
   } finally { for (const peer of peers) peer.close(); }
 }
 

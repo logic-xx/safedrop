@@ -39,7 +39,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
     // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
     const version = this.get('PRAGMA user_version')!.user_version;
-    need(version <= 1, 'DATABASE_VERSION_UNSUPPORTED');
+    need(version <= 2, 'DATABASE_VERSION_UNSUPPORTED');
     if (version < 1) this.transaction(() => {
       this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
@@ -48,6 +48,10 @@ export class Store {
         INSERT INTO settings VALUES('registration','invitation');
         CREATE INDEX invitations_created ON invitations(created DESC,id DESC);
         PRAGMA user_version=1;`);
+    });
+    if (version < 2) this.transaction(() => {
+      this.db.exec(`CREATE TABLE deletions(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('files','transfers')),userId TEXT NOT NULL,created INTEGER NOT NULL);
+        PRAGMA user_version=2;`);
     });
   }
   get(sql: string, ...args: any[]): Row | undefined { return this.db.prepare(sql).get(...args) as Row | undefined; }
@@ -59,6 +63,11 @@ export class Store {
     catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
   registration() { return this.get("SELECT value FROM settings WHERE key='registration'")!.value as string; }
+  usage(userId: string, limit: number) {
+    const files = this.get('SELECT COALESCE(SUM(size),0) AS bytes,COUNT(*) AS count FROM files WHERE userId=?', userId)!;
+    const transfers = this.get('SELECT COALESCE(SUM(size),0) AS bytes,COUNT(*) AS count FROM transfers WHERE userId=?', userId)!;
+    return { limit, used: files.bytes as number, reserved: transfers.bytes as number, available: Math.max(0, limit - files.bytes - transfers.bytes), fileCount: files.count as number, transferCount: transfers.count as number, overQuota: files.bytes + transfers.bytes > limit };
+  }
   async addUser(name: string, password: string, role = 'user', tier = 'normal') {
     validAccount(name, password);
     const userId = id(); this.run('INSERT INTO users(id,name,hash,role,tier) VALUES(?,?,?,?,?)', userId, name, await passwordHash(password), role, tier); return userId;

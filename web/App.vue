@@ -5,8 +5,9 @@ import { CHUNK } from '../shared/protocol.ts';
 import { Client, human, hashBlob, hex, bindKey, loginWithKey, localGet, localPut, saveJSON } from './client.ts';
 import { sessionRequests } from './session-requests.ts';
 import AccountAdmin from './AccountAdmin.vue';
+import FileAction from './FileAction.vue';
 type Row = Record<string, any>;
-type Task = { key: string; owner: string; name: string; kind: 'upload' | 'download'; total: number; done: number; status: string; paused: boolean; running?: boolean; file?: File; row?: Row; error?: string };
+type Task = { key: string; owner: string; name: string; kind: 'upload' | 'download'; total: number; done: number; status: string; paused: boolean; running?: boolean; file?: File; row?: Row; error?: string; transferId?: string; resumeKey?: string; terminal?: string };
 const client = new Client(), connection = ref('offline'), user = ref<Row>(), session = ref(''), name = ref('admin'), password = ref(''), busy = ref(false), notice = ref('');
 const secureTransport = location.protocol === 'https:';
 const tab = ref('files'), files = ref<Row[]>([]), transfers = ref<Row[]>([]), sessions = ref<Row[]>([]), events = ref<Row[]>([]), keys = ref<Row[]>([]), report = ref<Row | null>(null), tasks = ref<Task[]>([]), search = ref(''), auditResult = ref(''), reauth = ref('');
@@ -19,7 +20,7 @@ const accountRpc = computed(() => sessionRequests(client, session.value, () => s
 const accountAdmin = ref<InstanceType<typeof AccountAdmin>>();
 const list = computed(() => files.value.filter(f => f.name.toLowerCase().includes(search.value.toLowerCase())));
 const denied = computed(() => events.value.filter(e => e.result === 'denied').length);
-const total = computed(() => files.value.reduce((n, f) => n + f.size, 0));
+const usage = ref<Row>(), fileAction = ref<{ file: Row; mode: 'rename' | 'delete' }>();
 const visibleTasks = computed(() => tasks.value.filter(t => t.owner === user.value?.name));
 const active = computed(() => visibleTasks.value.filter(t => t.running).length);
 const size = (n: number) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
@@ -28,13 +29,15 @@ const percent = (t: Task) => t.total ? Math.floor(t.done / t.total * 100) : t.st
 const progressValue = (t: Task) => t.total ? t.done : t.status === '已完成' ? 1 : 0;
 function pauseTasks() { for (const t of tasks.value) if (t.status !== '已完成') t.paused = true; }
 client.onState = s => connection.value = s;
-client.onLost = (reason = '') => { if (user.value) { confirmation.value = ''; invitation.value = ''; } if (['ACCOUNT_DISABLED', 'PASSWORD_CHANGED', 'SESSION_REVOKED'].includes(reason)) notice.value = human(reason); pauseTasks(); user.value = undefined; session.value = ''; tab.value = 'files'; reauth.value = ''; currentPassword.value = ''; newPassword.value = ''; passwordError.value = ''; files.value = []; transfers.value = []; sessions.value = []; events.value = []; report.value = null; keys.value = []; };
+client.onLost = (reason = '') => { if (user.value) { confirmation.value = ''; invitation.value = ''; } if (['ACCOUNT_DISABLED', 'PASSWORD_CHANGED', 'SESSION_REVOKED'].includes(reason)) notice.value = human(reason); pauseTasks(); user.value = undefined; session.value = ''; tab.value = 'files'; reauth.value = ''; currentPassword.value = ''; newPassword.value = ''; passwordError.value = ''; usage.value = undefined; fileAction.value = undefined; files.value = []; transfers.value = []; sessions.value = []; events.value = []; report.value = null; keys.value = []; };
 async function attempt(fn: () => Promise<unknown>) { notice.value = ''; try { await fn(); } catch (e) { notice.value = human(e); } }
 async function refresh() {
   if (!user.value) return;
   const scoped = sessionRequests(client, session.value, () => session.value), isAdmin = user.value.role === 'admin';
   const all: Row[] = []; for (let offset = 0; offset <= 1000; offset += 12) { const f = await scoped.rpc('files.list', { offset }); const page = f.meta.files as Row[]; all.push(...page); if (page.length < 12) break; } files.value = all;
+  if (fileAction.value) { const current = all.find(f => f.id === fileAction.value!.file.id); if (current) fileAction.value = { ...fileAction.value, file: current }; else fileAction.value = undefined; }
   transfers.value = (await scoped.rpc('transfers.list')).meta.transfers as Row[];
+  usage.value = (await scoped.rpc('storage.usage')).meta;
   const e = await scoped.rpc('events.list'); events.value = e.meta.events as Row[];
   const s = await scoped.rpc('sessions.list'); sessions.value = s.meta.sessions as Row[];
   const k = await scoped.rpc('keys.list'); keys.value = k.meta.keys as Row[];
@@ -78,32 +81,49 @@ async function revokeKey(keyId: string) { await attempt(async () => { await clie
 async function revoke(sid: string) { await attempt(async () => { await client.rpc('sessions.revoke', { sessionId: sid }); if (sid !== session.value) await refresh(); }); }
 function enqueue(filesToAdd: FileList | null) {
   if (!filesToAdd || !user.value) return;
-  for (const file of [...filesToAdd]) { if (visibleTasks.value.some(t => t.kind === 'upload' && t.name === file.name && t.total === file.size && t.status !== '已完成')) continue; tasks.value.push({ key: crypto.randomUUID(), owner: user.value.name, name: file.name, total: file.size, done: 0, kind: 'upload', status: '等待传输', paused: false, file }); }
+  for (const file of [...filesToAdd]) { if (visibleTasks.value.some(t => t.kind === 'upload' && t.name === file.name && t.total === file.size && t.status !== '已完成' && !t.terminal)) continue; tasks.value.push({ key: crypto.randomUUID(), owner: user.value.name, name: file.name, total: file.size, done: 0, kind: 'upload', status: '等待传输', paused: false, file }); }
   if (uploading.value) uploading.value.value = ''; schedule();
 }
-function schedule() { for (const t of visibleTasks.value) { if (active.value >= 3) break; if (!t.running && !t.paused && t.status === '等待传输') void upload(t); } }
+function schedule() { for (const t of visibleTasks.value) { if (active.value >= 3) break; if (!t.terminal && !t.running && !t.paused && t.status === '等待传输') void upload(t); } }
 async function upload(t: Task) {
   if (!t.file || !user.value || t.owner !== user.value.name) return;
   t.running = true; t.status = '计算文件摘要'; t.error = ''; const account = user.value.name;
   const scoped = sessionRequests(client, session.value, () => session.value);
   try {
     const sha = await hashBlob(t.file); if (t.paused) return; scoped.assertCurrent();
-    const resumeKey = `upload:${account}:${sha}:${t.name}:${t.total}`;
+    const resumeKey = t.resumeKey = `upload:${account}:${sha}:${t.name}:${t.total}`;
     const remembered = await localGet<string>(resumeKey);
     const existing = transfers.value.find(x => x.name === t.name && x.size === t.total && x.sha256 === sha)?.id;
     let response;
     try { response = await scoped.rpc('upload.init', { name: t.name, size: t.total, sha256: sha, transferId: remembered ?? existing }); }
     catch (e) { if (e instanceof Error && e.message === 'NOT_FOUND') response = await scoped.rpc('upload.init', { name: t.name, size: t.total, sha256: sha }); else throw e; }
-    const transferId = String(response.meta.id); await localPut(resumeKey, transferId); t.done = Number(response.meta.offset); t.status = '正在上传';
+    const transferId = t.transferId = String(response.meta.id); await localPut(resumeKey, transferId); t.done = Number(response.meta.offset); t.status = '正在上传'; usage.value = (await scoped.rpc('storage.usage')).meta;
     while (t.done < t.total && !t.paused) {
       const data = new Uint8Array(await t.file.slice(t.done, t.done + CHUNK).arrayBuffer());
       const r = await scoped.rpc('upload.chunk', { transferId, offset: t.done }, data); t.done = Number(r.meta.offset);
     }
     if (!t.paused) { t.status = '服务端完整性校验'; await scoped.rpc('upload.finish', { transferId }); await localPut(resumeKey, undefined); t.status = '已完成'; await refresh(); }
   } catch (e) { t.error = human(e); t.paused = true; }
-  finally { if (t.paused) t.status = '已暂停'; t.running = false; schedule(); }
+  finally { if (t.terminal) t.status = t.terminal; else if (t.paused) t.status = '已暂停'; t.running = false; schedule(); }
 }
-async function cancelPending(row: Row) { await attempt(async () => { await client.rpc('upload.cancel', { transferId: row.id }); await refresh(); }); }
+async function cancelPending(row: Row) {
+  const scoped = sessionRequests(client, session.value, () => session.value), matching = visibleTasks.value.filter(t => t.transferId === row.id);
+  for (const t of matching) t.paused = true;
+  await attempt(async () => {
+    try { await scoped.rpc('upload.cancel', { transferId: row.id }); }
+    catch (e) { if (e instanceof Error && e.message === 'DELETE_FAILED') for (const t of matching) { t.terminal = t.status = '等待取消清理'; } await refresh(); throw e; }
+    for (const t of matching) { t.terminal = t.status = '已取消'; if (t.resumeKey) await localPut(t.resumeKey, undefined); }
+    await refresh();
+  });
+}
+async function fileChanged(mode: 'rename' | 'delete', file: Row) {
+  fileAction.value = undefined;
+  for (const t of visibleTasks.value) if (t.kind === 'download' && t.row?.id === file.id) {
+    if (mode === 'rename') { t.name = file.name; t.row = file; }
+    else if (t.status !== '已完成') { t.paused = true; t.terminal = t.status = '源文件已删除'; }
+  }
+  await attempt(refresh);
+}
 function downloadPreparing(row: Row) { return preparingDownloads.value.has(`${session.value}:${row.id}`); }
 async function download(row: Row) {
   if (!user.value || active.value >= 3) { notice.value = '当前已有三个任务运行，请稍后重试'; return; }
@@ -150,14 +170,15 @@ async function download(row: Row) {
     }
   } catch (e) {
     t.error = human(e); t.paused = true;
+    if (e instanceof Error && ['NOT_FOUND', 'FILE_DELETING'].includes(e.message)) { t.terminal = e.message === 'NOT_FOUND' ? '源文件已删除' : '源文件待删除'; await localPut(cacheKey, undefined); }
     if (e instanceof Error && ['PREFIX_MISMATCH', 'HASH_MISMATCH'].includes(e.message)) {
       await localPut(cacheKey, undefined);
       if (writer) { await writer.abort().catch(() => {}); writer = undefined; }
     }
   }
   finally {
-    if (writer) try { await writer.close(); if (handle) await localPut(cacheKey, { handle, offset: t.done }); } catch { /* Keep the last committed checkpoint. */ }
-    if (t.paused) t.status = '已暂停'; t.running = false; schedule();
+    if (writer) try { await writer.close(); if (handle) await localPut(cacheKey, t.terminal ? undefined : { handle, offset: t.done }); } catch { /* Keep the last committed checkpoint. */ }
+    if (t.terminal) t.status = t.terminal; else if (t.paused) t.status = '已暂停'; t.running = false; schedule();
   }
 }
 async function verifyLogs(anchor?: unknown) { await attempt(async () => { const r = await client.rpc('audit.verify', anchor ? { checkpoint: anchor } : {}); auditResult.value = r.meta.ok ? `校验通过 · 已检查 ${r.meta.count} 条记录${anchor ? '，与独立检查点一致' : '（尚未对照独立检查点）'}` : `校验失败 · ${r.meta.reason}，记录位置 ${r.meta.at ?? '检查点'}`; }); }
@@ -180,11 +201,13 @@ onUnmounted(() => { clearInterval(poll); clearInterval(heartbeat); client.stop()
   <div v-else class="app-shell">
     <aside class="sidebar"><a class="brand"><span class="brand-icon">S</span>SafeDrop</a><div class="workspace-label">安全文件工作空间</div><nav><button v-for="(label, key) in labels" :key="key" :class="{ selected: tab === key }" @click="tab = String(key)"><span>{{ key === 'files' ? '▤' : key === 'security' ? '◈' : '✓' }}</span>{{ label }}<b v-if="key === 'files' && active">{{ active }}</b></button></nav><div class="sidebar-bottom"><div class="secure-mark"><i class="dot"></i>{{ secureTransport ? 'SFT/1 安全通道' : 'SFT/1 本地界面测试' }}<small>文件完成后保持连接</small></div><div class="profile"><span class="avatar">{{ user.name[0].toUpperCase() }}</span><div>{{ user.name }}<small>{{ user.role === 'admin' ? '管理员' : '个人空间' }} · {{ user.tier === 'vip' ? 'VIP' : '标准' }}</small></div><button class="logout" title="退出登录" @click="logout">↗</button></div></div></aside>
     <main><header class="topbar"><span>工作空间 <span class="crumb">/</span> {{ labels[tab] }}</span><span class="connection"><i :class="connection === 'online' ? 'dot' : 'dot gray'"></i>{{ connection === 'online' ? (secureTransport ? '安全连接已建立' : '本地界面测试连接') : '连接已断开' }}</span></header><div class="page"><div class="page-heading"><div><span class="eyebrow">{{ tab === 'files' ? 'YOUR SECURE WORKSPACE' : tab === 'security' ? 'VISIBILITY & CONTROL' : tab === 'accounts' ? 'ACCOUNTS & INVITATIONS' : 'VERIFY, THEN TRUST' }}</span><h1>{{ labels[tab] }}</h1><p>{{ tab === 'files' ? '管理文件与传输任务，每一次完成都经过完整性校验。' : tab === 'security' ? '查看真实安全事件，管理在线会话与本机身份。' : tab === 'accounts' ? '控制注册入口，生成单次邀请并管理账号状态。' : '用可复现的测试和可校验的记录，验证安全设计。' }}</p></div><button class="secondary" @click="attempt(refresh)">↻ 刷新数据</button></div><div v-if="notice" class="notice dismiss" role="status">{{ notice }}<button @click="notice = ''">×</button></div>
-    <template v-if="tab === 'files'"><div class="stats"><article><span>我的文件</span><strong>{{ files.length }}<small>个</small></strong><p>仅展示当前账号可访问的文件</p></article><article><span>已用存储</span><strong>{{ size(total) }}</strong><p>文件上传完成后计入统计</p></article><article><span>账号传输速率上限</span><strong>{{ size(user.rate) }}<small>/s</small></strong><p>上传与下载、多会话共享额度</p></article></div>
+    <template v-if="tab === 'files'"><div class="stats"><article><span>已用空间</span><strong>{{ usage ? size(usage.used) : '—' }}</strong><p>已完成文件，含删除待重试的占用</p></article><article><span>上传预留空间</span><strong>{{ usage ? size(usage.reserved) : '—' }}</strong><p>未完成上传按完整文件大小预留</p></article><article><span>可用空间</span><strong>{{ usage ? size(usage.available) : '—' }}</strong><p>账号配额减去已用与预留空间</p></article></div><div class="quota-summary"><span>账号配额 {{ usage ? size(usage.limit) : '—' }}</span><span>我的文件 {{ usage?.fileCount ?? '—' }} 个</span><span>未完成上传 {{ usage?.transferCount ?? '—' }} 个</span><span>传输上限 {{ size(user.rate) }}/s · 双向及多会话共享</span></div><p v-if="usage?.overQuota" class="form-error">当前占用超过账号配额，请删除文件或取消未完成上传后再上传。</p>
+
     <section class="upload-zone" @dragover.prevent @drop.prevent="enqueue($event.dataTransfer?.files ?? null)"><div class="upload-icon">↑</div><div><h3>将文件拖到这里，开始安全传输</h3><p>支持多任务与断点续传 · 单文件最大 512 MB</p></div><button class="primary" @click="uploading?.click()">＋ 选择文件</button><input ref="uploading" hidden type="file" multiple @change="enqueue(($event.target as HTMLInputElement).files)"></section>
-    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"></div><div class="table-scroll"><table><thead><tr><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span class="badge">✓ SHA-256</span></td><td><button class="link" :disabled="downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button></td></tr><tr v-if="!list.length"><td colspan="5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
-    <section v-if="visibleTasks.length" class="card"><div class="card-heading"><h3>传输队列 <span class="count">{{ active }} 进行中</span></h3><span class="muted">最多同时运行 3 个任务</span></div><div v-for="t in visibleTasks" :key="t.key" class="task"><span class="transfer-symbol">{{ t.kind === 'upload' ? '↑' : '↓' }}</span><div class="task-body"><div class="task-title"><strong>{{ t.name }}</strong><span>{{ t.status }} · {{ percent(t) }}%</span></div><progress :value="progressValue(t)" :max="t.total || 1"></progress><small>{{ size(t.done) }} / {{ size(t.total) }}<span v-if="t.error" class="error-text"> · {{ t.error }}</span></small></div><button v-if="t.running" class="secondary small" @click="t.paused = true">暂停</button><button v-else-if="t.paused && t.kind === 'upload'" class="secondary small" @click="t.paused = false; t.status = '等待传输'; schedule()">继续</button><button v-else-if="t.paused && t.row" class="secondary small" :disabled="downloadPreparing(t.row)" @click="download(t.row)">{{ downloadPreparing(t.row) ? '等待文件授权…' : '恢复下载' }}</button><span v-else class="badge">{{ t.status }}</span></div></section>
-    <section v-if="transfers.length" class="card"><div class="card-heading"><h3>服务端未完成上传</h3><span class="muted">重新选择相同文件可继续</span></div><div v-for="t in transfers" :key="t.id" class="pending-row"><span>{{ t.name }}</span><small>{{ size(t.offset) }} / {{ size(t.size) }}</small><button class="link danger" @click="cancelPending(t)">取消并释放空间</button></div></section><p class="footnote">断点下载建议使用桌面版 Edge / Chrome；每 4 MB 保存检查点，暂停时保存当前位置。其他浏览器支持 32 MB 以内的普通下载。</p>
+    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"></div><div class="table-scroll"><table><thead><tr><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span></td><td class="file-buttons"><button class="link" :disabled="f.deleting || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting" @click="fileAction = { file: f, mode: 'rename' }">重命名</button><button class="link danger" @click="fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td colspan="5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
+    <FileAction v-if="fileAction" :key="fileAction.file.id + fileAction.mode" :file="fileAction.file" :mode="fileAction.mode" :rpc="accountRpc" @close="fileAction = undefined" @changed="fileChanged" @refresh="attempt(refresh)" />
+    <section v-if="visibleTasks.length" class="card"><div class="card-heading"><h3>传输队列 <span class="count">{{ active }} 进行中</span></h3><span class="muted">最多同时运行 3 个任务</span></div><div v-for="t in visibleTasks" :key="t.key" class="task"><span class="transfer-symbol">{{ t.kind === 'upload' ? '↑' : '↓' }}</span><div class="task-body"><div class="task-title"><strong>{{ t.name }}</strong><span>{{ t.status }} · {{ percent(t) }}%</span></div><progress :value="progressValue(t)" :max="t.total || 1"></progress><small>{{ size(t.done) }} / {{ size(t.total) }}<span v-if="t.error" class="error-text"> · {{ t.error }}</span></small></div><button v-if="t.running" class="secondary small" @click="t.paused = true">暂停</button><button v-else-if="!t.terminal && t.paused && t.kind === 'upload'" class="secondary small" @click="t.paused = false; t.status = '等待传输'; schedule()">继续</button><button v-else-if="!t.terminal && t.paused && t.row" class="secondary small" :disabled="downloadPreparing(t.row)" @click="download(t.row)">{{ downloadPreparing(t.row) ? '等待文件授权…' : '恢复下载' }}</button><span v-else class="badge">{{ t.status }}</span></div></section>
+    <section v-if="transfers.length" class="card"><div class="card-heading"><h3>服务端未完成上传</h3><span class="muted">取消待重试的任务仍占用预留空间</span></div><div v-for="t in transfers" :key="t.id" class="pending-row"><span>{{ t.name }}</span><small>{{ t.deleting ? '取消待重试 · ' : '' }}{{ size(t.offset) }} / {{ size(t.size) }}</small><button class="link danger" @click="cancelPending(t)">{{ t.deleting ? '重试取消清理' : '取消并清理上传' }}</button></div></section><p class="footnote">断点下载建议使用桌面版 Edge / Chrome；每 4 MB 保存检查点，暂停时保存当前位置。其他浏览器支持 32 MB 以内的普通下载。</p>
     </template>
     <template v-if="tab === 'security'"><div class="stats"><article><span>在线会话</span><strong>{{ sessions.length }}</strong><p>可即时撤销指定会话</p></article><article><span>最近拒绝事件</span><strong>{{ denied }}</strong><p>基于当前可见的最近事件</p></article><article><span>已绑定公钥</span><strong>{{ keys.length }}</strong><p>标准 P-256 挑战签名</p></article></div><section class="card"><div class="card-heading"><h3>在线会话</h3><span class="muted">仅管理自己的会话</span></div><div v-for="s in sessions" :key="s.id" class="session-row"><span class="session-icon">▣</span><div><strong>{{ s.agent.slice(0, 72) }}</strong><small>{{ s.ip }} · {{ time(s.created) }}</small></div><span v-if="s.id === session" class="badge">当前会话</span><button class="secondary small" @click="revoke(s.id)">{{ s.id === session ? '退出本会话' : '撤销会话' }}</button></div></section><section class="card"><div class="card-heading"><h3>修改口令</h3><span class="muted">修改后全部会话与已绑定公钥失效</span></div><form class="account-content password-form" @submit.prevent="changePassword"><div v-if="passwordError" ref="passwordFeedback" class="form-error" role="alert" tabindex="-1"><strong>口令未修改</strong><p>{{ passwordError }}</p></div><p class="muted">包括当前会话在内的传输将停止，文件和续传任务保留。请重新登录，并按需重新绑定公钥。</p><label>当前口令<input v-model="currentPassword" type="password" autocomplete="current-password" maxlength="256" required></label><label>新口令<input v-model="newPassword" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="12～256 个字符" required></label><label>确认新口令<input v-model="confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label><button class="primary" :disabled="changing">{{ changing ? '正在修改…' : '修改口令并退出全部会话' }}</button></form></section><section class="card"><div class="card-heading"><h3>公钥身份管理</h3><span class="muted">私钥留在浏览器内，不可导出</span></div><div class="key-form"><label>绑定或撤销前，请重新验证口令<input v-model="reauth" type="password" autocomplete="current-password" placeholder="输入当前账号口令"></label><button class="primary" :disabled="!reauth" @click="enroll">绑定本机公钥</button></div><div v-for="k in keys" :key="k.id" class="pending-row"><span>{{ k.label }}</span><small>{{ time(k.created) }}</small><button class="link danger" :disabled="!reauth" @click="revokeKey(k.id)">撤销公钥</button></div></section><section class="card"><div class="card-heading"><h3>安全事件时间线</h3><span class="muted">{{ user.role === 'admin' ? '管理员 · 全部用户' : '仅当前用户' }}</span></div><div v-for="e in events" :key="e.seq" class="event-row"><span :class="e.result === 'denied' ? 'event-dot rejected' : 'event-dot'"></span><div><strong>{{ e.action }}<span :class="e.result === 'denied' ? 'badge red' : 'badge'">{{ e.result === 'denied' ? '已拒绝' : '已允许' }}</span></strong><small>{{ e.user }} · {{ e.detail.code ?? (e.detail.size != null ? size(e.detail.size) : '操作已记录') }}</small></div><time>{{ time(e.time) }}</time></div><div v-if="!events.length" class="empty">尚无可见事件</div></section></template>
     <AccountAdmin ref="accountAdmin" v-if="tab === 'accounts' && user.role === 'admin'" :key="session" :rpc="accountRpc" />

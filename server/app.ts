@@ -12,10 +12,16 @@ import { createHash } from 'node:crypto';
 
 export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; challenge?: { key: Row; message: string; expires: number } }
-async function hashFile(path: string, bytes?: number) {
+function filename(value: unknown) {
+  const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
+}
+async function hashFile(path: string, bytes?: number, signal?: AbortSignal) {
   const h = createHash('sha256');
+  signal?.throwIfAborted();
   if (bytes === 0) return h.digest('hex');
-  for await (const chunk of createReadStream(path, bytes === undefined ? {} : { start: 0, end: bytes - 1 })) h.update(chunk);
+  const stream = createReadStream(path, { ...(bytes === undefined ? {} : { start: 0, end: bytes - 1 }), signal });
+  try { for await (const chunk of stream) h.update(chunk); }
+  finally { await new Promise<void>(done => { if (stream.closed) done(); else { stream.once('close', done); stream.destroy(); } }); }
   return h.digest('hex');
 }
 export function createApp(config: Config) {
@@ -25,6 +31,7 @@ export function createApp(config: Config) {
   const rate = new RateGate(), bw = new Bandwidth(config.normalRate, config.vipRate);
   const contexts = new Set<Context>(), locks = new Set<string>();
   const operations = new Set<Promise<void>>();
+  const downloads = new Map<string, Set<{ abort: AbortController; done: Promise<void> }>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
   const root = resolve(config.webRoot ?? 'dist');
   const request = (req: IncomingMessage, res: import('node:http').ServerResponse) => {
@@ -81,6 +88,48 @@ export function createApp(config: Config) {
   }
   function owned(c: Context, table: 'transfers' | 'files', transferId: unknown) {
     const u = authorized(c); const row = store.get(`SELECT * FROM ${table} WHERE id=? AND userId=?`, text(transferId, 80), u.id); need(row, 'NOT_FOUND'); return row;
+  }
+  function notDeleting(table: 'transfers' | 'files', targetId: string) {
+    need(!store.get('SELECT id FROM deletions WHERE id=? AND kind=?', targetId, table), table === 'files' ? 'FILE_DELETING' : 'TRANSFER_CANCELING');
+  }
+  function available(c: Context, table: 'transfers' | 'files', targetId: unknown) {
+    const row = owned(c, table, targetId); notDeleting(table, row.id); return row;
+  }
+  async function downloading<T>(c: Context, fileId: string, fn: (signal: AbortSignal) => Promise<T>) {
+    available(c, 'files', fileId);
+    const abort = new AbortController(); let settled!: () => void;
+    const job = { abort, done: new Promise<void>(r => { settled = r; }) };
+    let jobs = downloads.get(fileId); if (!jobs) downloads.set(fileId, jobs = new Set()); jobs.add(job);
+    try { return await fn(AbortSignal.any([c.abort.signal, abort.signal])); }
+    catch (e) { if (abort.signal.aborted) throw new Fault('FILE_DELETING'); throw e; }
+    finally { jobs.delete(job); if (!jobs.size) downloads.delete(fileId); settled(); }
+  }
+  async function erase(c: Context, table: 'transfers' | 'files', targetId: unknown) {
+    const row = owned(c, table, targetId), op = table === 'files' ? 'files.delete' : 'upload.cancel';
+    need(!locks.has(row.id), table === 'files' ? 'FILE_BUSY' : 'TRANSFER_BUSY'); locks.add(row.id);
+    try {
+      // The durable intent stops future access, but keeps the original row charged.
+      store.transaction(() => {
+        const inserted = store.run('INSERT OR IGNORE INTO deletions VALUES(?,?,?,?)', row.id, table, row.userId, Date.now());
+        if (inserted.changes) audit(c, op + '.requested', 'allowed', { id: row.id });
+      });
+      if (table === 'files') {
+        const jobs = [...(downloads.get(row.id) ?? [])]; for (const job of jobs) job.abort.abort();
+        await Promise.all(jobs.map(job => job.done));
+      }
+      // A crashed finish can leave a final object with an uncompleted transfer.
+      for (const folder of table === 'files' ? ['objects'] : ['staging', 'objects']) {
+        try { await unlink(join(config.root, folder, row.id)); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Fault('DELETE_FAILED'); }
+      }
+      // Once accepted, finish cleanup even if the requester disconnects or is revoked.
+      store.transaction(() => {
+        store.run(`DELETE FROM ${table} WHERE id=? AND userId=?`, row.id, row.userId);
+        store.run('DELETE FROM deletions WHERE id=? AND kind=?', row.id, table);
+        audit(c, op, 'allowed', { id: row.id, size: row.size });
+      });
+      return { meta: { deleted: true, id: row.id } };
+    } finally { locks.delete(row.id); }
   }
   async function dispatch(c: Context, f: Frame): Promise<{ meta?: Row; payload?: Uint8Array }> {
     const m = f.meta, op = text(m.op, 64);
@@ -191,23 +240,38 @@ export function createApp(config: Config) {
       });
       stopUser(userId, 'ACCOUNT_DISABLED', c); return {};
     }
-    if (op === 'files.list') return { meta: { files: store.all('SELECT id,name,size,sha256,created FROM files WHERE userId=? ORDER BY created DESC,id DESC LIMIT 12 OFFSET ?', u.id, integer(m.offset ?? 0, 10000)) } };
-    if (op === 'transfers.list') return { meta: { transfers: store.all('SELECT id,name,size,sha256,offset,created FROM transfers WHERE userId=? ORDER BY created DESC LIMIT 16', u.id) } };
-    if (op === 'upload.init') {
-      const name = text(m.name); need(!/[\\/\x00-\x1f:]/.test(name) && !['.', '..'].includes(name), 'INVALID_FILENAME');
-      const size = integer(m.size, config.maxFile ?? 512 * 1024 ** 2), sha = text(m.sha256, 64); need(/^[a-f0-9]{64}$/.test(sha), 'INVALID_HASH');
-      if (m.transferId) { const t = store.get('SELECT * FROM transfers WHERE id=? AND userId=?', text(m.transferId, 80), u.id) ?? store.get('SELECT *,size AS offset,1 AS completed FROM files WHERE id=? AND userId=?', m.transferId, u.id); need(t, 'NOT_FOUND'); need(t.name === name && t.size === size && t.sha256 === sha, 'FILE_CHANGED'); return { meta: t }; }
-      need(store.get('SELECT COUNT(*) AS n FROM files WHERE userId=?', u.id)!.n < 1000, 'FILE_COUNT_LIMIT');
-      need(store.get('SELECT COUNT(*) AS n FROM transfers WHERE userId=?', u.id)!.n < 16, 'TRANSFER_LIMIT');
-      const used = store.get('SELECT (SELECT COALESCE(SUM(size),0) FROM files WHERE userId=?) + (SELECT COALESCE(SUM(size),0) FROM transfers WHERE userId=?) AS n', u.id, u.id)!.n;
-      need(used + size <= (config.quota ?? 1024 ** 3), 'STORAGE_QUOTA');
-      const transferId = id(); store.run('INSERT INTO transfers VALUES(?,?,?,?,?,0,?)', transferId, u.id, name, size, sha, Date.now());
-      try { const h = await open(join(config.root, 'staging', transferId), 'wx', 0o600); await h.close(); } catch (e) { store.run('DELETE FROM transfers WHERE id=?', transferId); throw e; }
-      audit(c, op, 'allowed', { transferId, size }); return { meta: { id: transferId, offset: 0 } };
+    if (op === 'storage.usage') return { meta: store.usage(u.id, config.quota ?? 1024 ** 3) };
+    if (op === 'files.list') return { meta: { files: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id IS NOT NULL AS deleting FROM files f LEFT JOIN deletions d ON d.id=f.id AND d.kind='files' WHERE f.userId=? ORDER BY f.created DESC,f.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)) } };
+    if (op === 'transfers.list') return { meta: { transfers: store.all("SELECT t.id,t.name,t.size,t.sha256,t.offset,t.created,d.id IS NOT NULL AS deleting FROM transfers t LEFT JOIN deletions d ON d.id=t.id AND d.kind='transfers' WHERE t.userId=? ORDER BY t.created DESC LIMIT 16", u.id) } };
+    if (op === 'files.rename' || op === 'files.delete' || op === 'upload.cancel') {
+      need(rate.allow('file-mutation:' + u.id, 60), 'RATE_LIMITED');
+      if (op === 'files.delete' || op === 'upload.cancel') return erase(c, op === 'files.delete' ? 'files' : 'transfers', op === 'files.delete' ? m.fileId : m.transferId);
+      const file = available(c, 'files', m.fileId), name = filename(m.name); need(!locks.has(file.id), 'FILE_BUSY');
+      store.transaction(() => { store.run('UPDATE files SET name=? WHERE id=? AND userId=?', name, file.id, u.id); audit(c, op, 'allowed', { fileId: file.id, oldName: file.name, name }); });
+      return { meta: { file: { id: file.id, name, size: file.size, sha256: file.sha256, created: file.created, deleting: 0 } } };
     }
-    if (['upload.chunk', 'upload.finish', 'upload.cancel'].includes(op)) {
-      if (op === 'upload.finish') { const done = store.get('SELECT id,sha256 FROM files WHERE id=? AND userId=?', text(m.transferId, 80), u.id); if (done) return { meta: { fileId: done.id, sha256: done.sha256 } }; }
-      const t = owned(c, 'transfers', m.transferId); need(!locks.has(t.id), 'TRANSFER_BUSY'); locks.add(t.id);
+    if (op === 'upload.init') {
+      const name = filename(m.name);
+      const size = integer(m.size, config.maxFile ?? 512 * 1024 ** 2), sha = text(m.sha256, 64); need(/^[a-f0-9]{64}$/.test(sha), 'INVALID_HASH');
+      if (m.transferId) { const t = store.get('SELECT * FROM transfers WHERE id=? AND userId=?', text(m.transferId, 80), u.id) ?? store.get('SELECT *,size AS offset,1 AS completed FROM files WHERE id=? AND userId=?', m.transferId, u.id); need(t, 'NOT_FOUND'); notDeleting(t.completed ? 'files' : 'transfers', t.id); need(t.name === name && t.size === size && t.sha256 === sha, 'FILE_CHANGED'); return { meta: t }; }
+      const usage = store.usage(u.id, config.quota ?? 1024 ** 3);
+      need(usage.fileCount + usage.transferCount < 1000, 'FILE_COUNT_LIMIT');
+      need(usage.transferCount < 16, 'TRANSFER_LIMIT');
+      need(usage.used + usage.reserved + size <= usage.limit, 'STORAGE_QUOTA');
+      const transferId = id(); store.run('INSERT INTO transfers VALUES(?,?,?,?,?,0,?)', transferId, u.id, name, size, sha, Date.now());
+      locks.add(transferId);
+      try {
+        try { const h = await open(join(config.root, 'staging', transferId), 'wx', 0o600); await h.close(); }
+        catch {
+          store.transaction(() => { store.run("INSERT INTO deletions VALUES(?,'transfers',?,?)", transferId, u.id, Date.now()); audit(c, 'upload.prepare', 'denied', { transferId, code: 'UPLOAD_PREPARE_FAILED' }); });
+          throw new Fault('UPLOAD_PREPARE_FAILED');
+        }
+        audit(c, op, 'allowed', { transferId, size }); return { meta: { id: transferId, offset: 0 } };
+      } finally { locks.delete(transferId); }
+    }
+    if (['upload.chunk', 'upload.finish'].includes(op)) {
+      if (op === 'upload.finish') { const done = store.get('SELECT id,sha256 FROM files WHERE id=? AND userId=?', text(m.transferId, 80), u.id); if (done) { notDeleting('files', done.id); return { meta: { fileId: done.id, sha256: done.sha256 } }; } }
+      const t = available(c, 'transfers', m.transferId); need(!locks.has(t.id), 'TRANSFER_BUSY'); locks.add(t.id);
       const path = join(config.root, 'staging', t.id);
       try {
         if (op === 'upload.chunk') {
@@ -226,7 +290,6 @@ export function createApp(config: Config) {
           } finally { await h.close(); }
           return { meta: { offset: t.offset } };
         }
-        if (op === 'upload.cancel') { await unlink(path).catch(() => {}); authorized(c); store.run('DELETE FROM transfers WHERE id=?', t.id); audit(c, op, 'allowed', { transferId: t.id }); return {}; }
         need(t.offset === t.size, 'INCOMPLETE_FILE'); need(hashing < 4, 'SERVER_BUSY'); hashing++;
         try {
           const final = join(config.root, 'objects', t.id), source = existsSync(path) ? path : final;
@@ -240,16 +303,20 @@ export function createApp(config: Config) {
       } finally { locks.delete(t.id); }
     }
     if (op === 'download.init') {
-      const file = owned(c, 'files', m.fileId), offset = integer(m.offset ?? 0, file.size);
-      if (offset) { need(hashing < 4, 'SERVER_BUSY'); hashing++; try { need(await hashFile(join(config.root, 'objects', file.id), offset) === m.prefixHash, 'PREFIX_MISMATCH'); } finally { hashing--; } }
-      authorized(c); audit(c, op, 'allowed', { fileId: file.id, offset }); return { meta: file };
+      const file = available(c, 'files', m.fileId), offset = integer(m.offset ?? 0, file.size);
+      return downloading(c, file.id, async signal => {
+        if (offset) { need(hashing < 4, 'SERVER_BUSY'); hashing++; try { need(await hashFile(join(config.root, 'objects', file.id), offset, signal) === m.prefixHash, 'PREFIX_MISMATCH'); } finally { hashing--; } }
+        available(c, 'files', file.id); audit(c, op, 'allowed', { fileId: file.id, offset }); return { meta: file };
+      });
     }
     if (op === 'download.chunk') {
-      const file = owned(c, 'files', m.fileId), offset = integer(m.offset, file.size), length = Math.min(CHUNK, file.size - offset);
-      await bw.take(u.id, u.tier, length, c.abort.signal); authorized(c);
-      const h = await open(join(config.root, 'objects', file.id), 'r'); const out = Buffer.alloc(length);
-      try { const { bytesRead } = await h.read(out, 0, length, offset); need(bytesRead === length, 'READ_FAILED'); } finally { await h.close(); }
-      authorized(c); return { meta: { offset, next: offset + length, eof: offset + length === file.size }, payload: out };
+      const file = available(c, 'files', m.fileId), offset = integer(m.offset, file.size), length = Math.min(CHUNK, file.size - offset);
+      return downloading(c, file.id, async signal => {
+        await bw.take(u.id, u.tier, length, signal); available(c, 'files', file.id);
+        const h = await open(join(config.root, 'objects', file.id), 'r'), out = Buffer.alloc(length);
+        try { signal.throwIfAborted(); available(c, 'files', file.id); const { bytesRead } = await h.read(out, 0, length, offset); need(bytesRead === length, 'READ_FAILED'); } finally { await h.close(); }
+        available(c, 'files', file.id); return { meta: { offset, next: offset + length, eof: offset + length === file.size }, payload: out };
+      });
     }
     if (op === 'sessions.list') return { meta: { sessions: store.all('SELECT id,created,expires,agent,ip FROM sessions WHERE userId=? AND revoked=0 AND expires>? ORDER BY created DESC', u.id, Date.now()), current: c.session } };
     if (op === 'sessions.revoke' || op === 'auth.logout') {
@@ -293,6 +360,7 @@ export function createApp(config: Config) {
         let frame: Frame | undefined;
         try {
           c.abort.signal.throwIfAborted(); frame = decode(bytes); const result = await dispatch(c, frame);
+          if (frame.meta.op === 'download.chunk' || frame.meta.op === 'download.init') available(c, 'files', frame.meta.fileId);
           if (ws.readyState === WebSocket.OPEN && !c.abort.signal.aborted) ws.send(encode(2, frame.requestId, { ok: true, ...result.meta }, result.payload, frame.streamId));
         } catch (e) {
           const code = e instanceof Fault ? e.code : frame ? 'INTERNAL_ERROR' : 'INVALID_FRAME';

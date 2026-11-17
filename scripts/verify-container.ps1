@@ -18,6 +18,13 @@ try {
         & docker @DockerArgs
         if ($LASTEXITCODE -ne 0) { throw 'Docker command failed. Keep the error above for diagnosis.' }
     }
+    function Invoke-DockerInput {
+        param([string]$InputText, [string[]]$DockerArgs)
+        # Windows PowerShell's native argument quoting can strip embedded quotes.
+        # Feed source on stdin instead of passing a JavaScript program through --eval.
+        $InputText | & docker @DockerArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Docker input command failed. Keep the error above for diagnosis.' }
+    }
     function Assert-Condition {
         param([bool]$Condition, [string]$Message)
         if (-not $Condition) { throw $Message }
@@ -50,8 +57,8 @@ try {
     if ($existingApp) {
         # Runs against the old image too: the source uses only built-in Node modules.
         # Capture only row fingerprints; no password hashes, names or tokens are printed.
-        $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module', '--eval', $snapshotSource)
-        $existingSnapshot = (Invoke-DockerChecked -DockerArgs $snapshotArgs | ConvertFrom-Json)
+        $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
+        $existingSnapshot = (Invoke-DockerInput -InputText $snapshotSource -DockerArgs $snapshotArgs | ConvertFrom-Json)
     }
     Write-Host 'Building and starting isolated project safedrop-check on https://localhost:18443 ...'
     # Mounted Caddyfile changes require a new process even if its path is stable.
@@ -59,8 +66,8 @@ try {
     Invoke-DockerChecked @composeArgs up --build --force-recreate --detach --wait --wait-timeout 180
     $existingData = [ordered]@{ checked = $false; records = 0 }
     if ($null -ne $existingSnapshot) {
-        $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module', '--eval', $snapshotSource)
-        $upgradedSnapshot = (Invoke-DockerChecked -DockerArgs $snapshotArgs | ConvertFrom-Json)
+        $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
+        $upgradedSnapshot = (Invoke-DockerInput -InputText $snapshotSource -DockerArgs $snapshotArgs | ConvertFrom-Json)
         foreach ($table in $existingSnapshot.tables.PSObject.Properties) {
             $upgradedTable = $upgradedSnapshot.tables.PSObject.Properties[$table.Name].Value
             foreach ($record in $table.Value.PSObject.Properties) {
@@ -130,7 +137,7 @@ try {
     Invoke-DockerChecked @composeArgs cp 'gateway:/data/caddy/pki/authorities/local/root.crt' (Join-Path $privateDir 'ca-after.crt')
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts-after.json') -Algorithm SHA256).Hash -eq $accountsHash) 'Generated credentials changed after restart.'
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'ca-after.crt') -Algorithm SHA256).Hash -eq $caHash) 'The gateway CA changed after restart.'
-    $summary = [ordered]@{ version = 3; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true }
+    $summary = [ordered]@{ version = 4; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'
