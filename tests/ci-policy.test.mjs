@@ -4,7 +4,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { join, resolve, sep } from 'node:path';
-import { auditPolicy, safeSourcePath, imagePolicy } from '../scripts/ci/policy.mjs';
+import { auditPolicy, safeSourcePath, imagePolicy, secureNode24 } from '../scripts/ci/policy.mjs';
+test('CI runtime evidence requires a security-patched supported Node 24 version',()=>{
+  for(const version of ['v24.14.0','v24.22.0','v24.22.2','v25.0.0','v26.0.0','v24.22.3-rc.1','']) assert.equal(secureNode24(version),false,version);
+  for(const version of ['v24.22.3','24.22.4','v24.23.0']) assert.equal(secureNode24(version),true,version);
+});
 const empty = () => ({auditReportVersion:2,metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0,total:0}},vulnerabilities:{}});
 const advisory='https://example.invalid/advisory', now=Date.parse('2026-11-18T00:00:00Z');
 function fixture() {

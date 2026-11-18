@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 export const high = severity => ['high', 'critical', 'HIGH', 'CRITICAL'].includes(severity);
+export function secureNode24(version) {
+  const match = /^v?24\.(\d+)\.(\d+)$/.exec(version ?? '');
+  return Boolean(match && (+match[1] > 22 || +match[1] === 22 && +match[2] >= 3));
+}
 export function auditPolicy(all, production, lock, exceptions, now = Date.now()) {
   for (const report of [all, production]) {
     assert.equal(report.auditReportVersion, 2, 'INVALID_AUDIT_REPORT');

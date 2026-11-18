@@ -19,6 +19,7 @@
     "ci:secrets": "node scripts/ci/check.mjs secrets",
     "ci:scanner-test": "node scripts/ci/check.mjs scanner-test",
     "ci:artifacts": "node scripts/ci/check.mjs artifacts",
+    "ci:runtime-report": "node scripts/ci/check.mjs runtime-report",
     "ci:workflow": "node scripts/ci/check.mjs workflow",
     "ci:image": "node scripts/ci/check.mjs image"
   },

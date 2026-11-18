@@ -7,6 +7,8 @@ import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { WebSocket } from 'ws';
+const [major, minor, patch] = process.versions.node.split('.').map(Number);
+assert.ok(major === 24 && (minor > 22 || minor === 22 && patch >= 3), 'Runtime requires a security-patched Node 24 release');
 const runtime = process.env.MFA_SMOKE_BUILD ?? resolve('build');
 // Keep Docker's Windows stdin transport ASCII-only; Node decodes the escapes.
 const enableConfirmation = '\u542f\u7528\u53cc\u56e0\u7d20\u8ba4\u8bc1';
@@ -36,5 +38,5 @@ try {
   assert.equal((await recovery.p.rpc('maintenance.status')).ok, true);
   await app.close(); app = createApp(config); await start(); const restarted = await enter(); assert.equal(restarted.first.mfaRequired, true);
   now += 30000; await restarted.p.rpc('auth.mfa', { challenge: restarted.first.challenge, code: totp(unbase32(replacement.secret), now) }); assert.equal((await restarted.p.rpc('maintenance.status')).ok, true);
-  console.log(JSON.stringify({ ok: true, version: 1, scope: 'isolated temporary data in final runtime', databaseVersion: 5, checks: ['enable and encrypted key persistence', 'password alone cannot access business', 'TOTP replay denied and full login accepted', 'recovery session restricted until new authenticator verified', 'MFA still required and usable after process restart'], originalAccountsChanged: false, originalDataChanged: false }));
+  console.log(JSON.stringify({ ok: true, version: 1, node: process.version, scope: 'isolated temporary data in final runtime', databaseVersion: 5, checks: ['enable and encrypted key persistence', 'password alone cannot access business', 'TOTP replay denied and full login accepted', 'recovery session restricted until new authenticator verified', 'MFA still required and usable after process restart'], originalAccountsChanged: false, originalDataChanged: false }));
 } finally { await app.close(); }

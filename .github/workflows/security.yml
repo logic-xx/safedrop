@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.14.0'
+          node-version: '24.22.3'
           package-manager-cache: false
       - run: npm ci --cache .npm-cache
       - name: Locate OpenSSL on Windows
@@ -71,7 +71,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.14.0'
+          node-version: '24.22.3'
           package-manager-cache: false
       - run: npm ci --ignore-scripts --cache .npm-cache
       - run: npm run ci:workflow
@@ -104,11 +104,19 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.14.0'
+          node-version: '24.22.3'
           package-manager-cache: false
-      - run: docker build --tag safedrop:ci .
+      - run: npm ci --cache .npm-cache
+      - name: Verify the isolated runtime containers
+        id: runtime
+        shell: pwsh
+        run: ./scripts/verify-container.ps1
+      - name: Record sanitized runtime results
+        if: always() && steps.runtime.outcome == 'success'
+        run: npm run ci:runtime-report
       - name: Scan the actual built application image
-        run: npm run ci:image -- safedrop:ci
+        if: always() && steps.runtime.outcome == 'success'
+        run: npm run ci:image -- safedrop:verify
       - name: Scan the gateway image
         if: always()
         run: npm run ci:image -- caddy:2.11.9-alpine remote

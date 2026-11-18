@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { resolve, join, dirname, sep } from 'node:path';
 import { tool } from './tool.mjs';
-import { auditPolicy, safeSourcePath, imagePolicy } from './policy.mjs';
+import { auditPolicy, safeSourcePath, imagePolicy, secureNode24 } from './policy.mjs';
 const [mode, reference, imageSource = 'docker'] = process.argv.slice(2);
 const git = args => execFileSync('git', args, { encoding: 'utf8', windowsHide: true });
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
@@ -15,7 +15,7 @@ const metadata = { created: new Date().toISOString(), commit: git(['rev-parse','
 const save = async (name, result) => writeFile(join(reportRoot, name + '.json'), JSON.stringify({ ...metadata, ...result }, null, 2) + '\n');
 const run = (executable, args, timeout = 600000, env = process.env) => spawnSync(executable, args, { encoding: 'utf8', windowsHide: true, timeout, env, maxBuffer: 16 * 1024 ** 2 });
 const resultName = mode === 'image' && reference ? 'image-' + digest(reference).slice(0,12) : mode;
-const modes = ['audit','secrets','scanner-test','workflow','image','artifacts'];
+const modes = ['audit','secrets','scanner-test','workflow','image','artifacts','runtime-report'];
 const failureName = 'failure-' + (modes.includes(mode) ? resultName : 'usage');
 try {
   if (modes.includes(mode)) {
@@ -63,6 +63,11 @@ try {
       if (!snapshot.startsWith(resolve('.local') + sep) || !snapshot.startsWith(resolve('.local/ci-source-'))) throw Error('UNSAFE_TEMP_CLEANUP');
       await rm(snapshot, { recursive: true, force: true });
     }
+  } else if (mode === 'runtime-report') {
+    const report = await json('reports/container-latest.json');
+    if(report.ok !== true || report.version !== 7 || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
+    await save('runtime-report',{ok:true,scope:'isolated CI containers; no user data volumes',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,profileChecks:report.profile.checks.length});
+    console.log('Isolated runtime, strict HTTPS/WSS, persistent data and backup checks: passed');
   } else if (mode === 'artifacts') {
     const executable = await tool('gitleaks'), snapshot = await mkdtemp(resolve('.local/ci-artifact-'));
     const paths = ['reports/latest.json','reports/latest.html',...(await readdir(reportRoot)).filter(n=>n.endsWith('.json')).map(n=>'reports/ci/'+n)];
@@ -113,7 +118,7 @@ try {
     const database = await json(resolve('.local/trivy-cache/db/metadata.json')).catch(()=>null);
     await save(resultName, { ...policy, reference, imageSource, scope: imageSource === 'docker' ? 'local built image' : 'remote registry image; not the final application image', database, version: (await json(new URL('./tools.json',import.meta.url))).trivy.version });
     console.log(`Image scan: ${policy.status}; high/critical ${policy.blocked}; report reports/ci/${resultName}.json`); if (!policy.ok) process.exitCode = 1;
-  } else throw Error('Usage: check.mjs <audit|secrets|scanner-test|workflow|image|artifacts> [image-reference] [docker|remote]');
+  } else throw Error('Usage: check.mjs <audit|secrets|scanner-test|workflow|image|artifacts|runtime-report> [image-reference] [docker|remote]');
 } catch (e) {
   const error = e instanceof Error ? e.message : 'CI_CHECK_FAILED';
   await save(failureName, { ok:false, error, ...(mode === 'image' ? { reference, imageSource } : {}) });
