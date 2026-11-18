@@ -11,9 +11,10 @@ import { Bandwidth, RateGate } from './limits.ts';
 import { createHash } from 'node:crypto';
 import { StorageGuard, type StoragePolicy } from './storage.ts';
 import { backupList, createBackup } from './backup.ts';
+import { backupKeyLocation, readBackupKeys, backupKeyInfo } from './backup-keys.ts';
 import { MfaGuard, base32, type MfaProof } from './mfa.ts';
 
-export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number }
+export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
@@ -30,6 +31,7 @@ async function hashFile(path: string, bytes?: number, signal?: AbortSignal) {
 export function createApp(config: Config) {
   const store = new Store(config.root, config.storage?.auditLimit ?? 64 * 1024 ** 2);
   const backupRoot = resolve(config.storage?.backupRoot ?? config.root + '.backups');
+  const backupKeyFile = resolve(config.backupKeyFile ?? config.root + '.backup-keys');
   let mfa: MfaGuard;
   try { mfa = new MfaGuard(store, resolve(config.mfaKeyFile ?? config.root + '.mfa-key'), config.mfaClock, backupRoot); }
   catch (e) { store.close(); throw e; }
@@ -330,7 +332,10 @@ export function createApp(config: Config) {
     }
     if (op === 'maintenance.status') {
       admin(c); const backups = await backupList(backupRoot);
-      return { meta: { storage: storage.usage(), audit: { bytes: store.auditBytes, limit: store.auditLimit, protected: store.auditBytes + 65536 > store.auditLimit }, staleDays: (config.storage?.staleMs ?? 7 * 86400000) / 86400000, expiredBatch: storage.expired().length, cleanupAutomatic: Boolean(config.storage?.cleanupIntervalMs), backups, backupCount: config.storage?.backupCount ?? 3, busy: maintenanceBusy } };
+      let backupEncryption: Record<string, unknown>;
+      try { await backupKeyLocation(backupKeyFile, config.root, backupRoot, resolve(config.mfaKeyFile ?? config.root + '.mfa-key')); const ring = await readBackupKeys(backupKeyFile); backupEncryption = { required: true, configured: true, ...backupKeyInfo(ring) }; }
+      catch (error) { backupEncryption = { required: true, configured: false, error: error instanceof Fault ? error.code : 'BACKUP_KEY_UNAVAILABLE' }; }
+      return { meta: { storage: storage.usage(), audit: { bytes: store.auditBytes, limit: store.auditLimit, protected: store.auditBytes + 65536 > store.auditLimit }, staleDays: (config.storage?.staleMs ?? 7 * 86400000) / 86400000, expiredBatch: storage.expired().length, cleanupAutomatic: Boolean(config.storage?.cleanupIntervalMs), backups, backupEncryption, backupCount: config.storage?.backupCount ?? 3, busy: maintenanceBusy } };
     }
     if (op === 'maintenance.cleanup') {
       admin(c); need(m.confirm === '清理过期上传', 'INVALID_INPUT'); need(rate.allow('maintenance:' + u.id, 6), 'RATE_LIMITED');
@@ -341,10 +346,11 @@ export function createApp(config: Config) {
       maintenanceBusy = true;
       try {
         await Promise.allSettled([...activeDispatches]); authorized(c);
+        await backupKeyLocation(backupKeyFile, config.root, backupRoot, resolve(config.mfaKeyFile ?? config.root + '.mfa-key'));
         audit(c, 'maintenance.backup.begin', 'allowed');
         const s = storage.usage();
-        const result = await createBackup(store, backupRoot, { quota: config.storage?.backupQuota ?? 20 * 1024 ** 3, count: config.storage?.backupCount ?? 3, minFree: s.minFree, pending: s.pending });
-        audit(c, 'maintenance.backup', 'allowed', { backupId: result.id, bytes: result.bytes }); return { meta: result };
+        const result = await createBackup(store, backupRoot, { quota: config.storage?.backupQuota ?? 20 * 1024 ** 3, count: config.storage?.backupCount ?? 3, minFree: s.minFree, pending: s.pending, keyFile: backupKeyFile });
+        audit(c, 'maintenance.backup', 'allowed', { backupId: result.id, bytes: result.bytes, encrypted: true, keyId: result.keyId }); return { meta: result };
       } finally { maintenanceBusy = false; }
     }
     if (op === 'account.password') {

@@ -47,7 +47,7 @@ try {
     $privateDir = Join-Path $projectRoot '.local/container-check'
     New-Item -ItemType Directory -Path $privateDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $projectRoot 'reports') -Force | Out-Null
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
@@ -154,6 +154,23 @@ try {
     $mfaResult = Invoke-DockerInput -InputText $mfaSource -DockerArgs $mfaArgs | ConvertFrom-Json
     Assert-Condition ([bool]$mfaResult.ok) 'Isolated MFA verification failed inside the final container image.'
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-mfa.json'), ($mfaResult | ConvertTo-Json -Depth 5), $utf8)
+    $backupProbe = Get-Content -LiteralPath 'tests/container-backup.mjs' -Raw -Encoding UTF8
+    $backupResult = Invoke-DockerInput -InputText $backupProbe -DockerArgs $mfaArgs | ConvertFrom-Json
+    Assert-Condition ([bool]$backupResult.ok) 'Isolated encrypted backup verification failed inside the final runtime.'
+    # Explicit initialization for this verification deployment. Existing keys are never replaced.
+    # The CLI refuses a new key when encrypted copies exist but their key file is missing.
+    $keyPresenceSource = "import {existsSync} from 'node:fs'; console.log(JSON.stringify({present:existsSync('/data/store.backup-keys')}));"
+    $keyPresence = Invoke-DockerInput -InputText $keyPresenceSource -DockerArgs $mfaArgs | ConvertFrom-Json
+    if ($keyPresence.present) {
+        $backupKeyStatus = Invoke-DockerChecked @composeArgs exec --no-TTY app node build/scripts/maintenance.js keys-status --key-file /data/store.backup-keys --data-dir /data/store --backup-dir /data/store.backups | ConvertFrom-Json
+    } else {
+        $backupKeyStatus = Invoke-DockerChecked @composeArgs exec --no-TTY app node build/scripts/maintenance.js keys-init --key-file /data/store.backup-keys --data-dir /data/store --backup-dir /data/store.backups | ConvertFrom-Json
+    }
+    Assert-Condition ($backupKeyStatus.activeKeyId -match '^[0-9a-f-]{36}$') 'The independent backup key identifier is invalid.'
+    $backupResult | Add-Member -NotePropertyName activeKeyId -NotePropertyValue $backupKeyStatus.activeKeyId
+    $hostBackupKey = Join-Path $privateDir 'deployment.backup-keys'
+    Invoke-DockerChecked @composeArgs cp 'app:/data/store.backup-keys' $hostBackupKey
+    $backupKeyHash = (Get-FileHash -LiteralPath $hostBackupKey -Algorithm SHA256).Hash
     & node 'node_modules/tsx/dist/cli.mjs' 'tests/container-smoke.ts' seed $privateDir
     if ($LASTEXITCODE -ne 0) { throw 'HTTPS/WSS transfer checks failed before restart.' }
     # The host keeps an independent checkpoint and restores only into a fresh private directory.
@@ -164,10 +181,10 @@ try {
     Invoke-DockerChecked @composeArgs cp ("app:/data/store.backups/" + $maintenanceState.backupId) $backupPath
     $checkpointPath = Join-Path $privateDir 'maintenance-checkpoint.json'
     [IO.File]::WriteAllText($checkpointPath, ($maintenanceState.checkpoint | ConvertTo-Json), $utf8)
-    & node 'node_modules/tsx/dist/cli.mjs' 'scripts/maintenance.ts' verify --source $backupPath --anchor $checkpointPath
+    & node 'node_modules/tsx/dist/cli.mjs' 'scripts/maintenance.ts' verify --source $backupPath --anchor $checkpointPath --key-file $hostBackupKey
     if ($LASTEXITCODE -ne 0) { throw 'Copied backup failed integrity or independent checkpoint verification.' }
     $restorePath = Join-Path $privateDir ('restore-' + [Guid]::NewGuid().ToString())
-    & node 'node_modules/tsx/dist/cli.mjs' 'scripts/maintenance.ts' restore --source $backupPath --target $restorePath --anchor $checkpointPath
+    & node 'node_modules/tsx/dist/cli.mjs' 'scripts/maintenance.ts' restore --source $backupPath --target $restorePath --anchor $checkpointPath --key-file $hostBackupKey
     if ($LASTEXITCODE -ne 0) { throw 'Isolated restore failed. Existing verification data remains unchanged.' }
     Write-Host 'Restarting the verification containers while retaining their data volumes ...'
     Invoke-DockerChecked @composeArgs restart app gateway
@@ -177,7 +194,12 @@ try {
     Invoke-DockerChecked @composeArgs cp 'gateway:/data/caddy/pki/authorities/local/root.crt' (Join-Path $privateDir 'ca-after.crt')
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts-after.json') -Algorithm SHA256).Hash -eq $accountsHash) 'Generated credentials changed after restart.'
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'ca-after.crt') -Algorithm SHA256).Hash -eq $caHash) 'The gateway CA changed after restart.'
-    $summary = [ordered]@{ version = 8; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true }; mfa = $mfaResult }
+    $hostBackupKeyAfter = Join-Path $privateDir 'deployment-after.backup-keys'
+    Invoke-DockerChecked @composeArgs cp 'app:/data/store.backup-keys' $hostBackupKeyAfter
+    Assert-Condition ((Get-FileHash -LiteralPath $hostBackupKeyAfter -Algorithm SHA256).Hash -eq $backupKeyHash) 'The independent backup key file changed after restart.'
+    $backupResult | Add-Member -NotePropertyName stableKeyRing -NotePropertyValue $true
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-backup.json'), ($backupResult | ConvertTo-Json -Depth 5), $utf8)
+    $summary = [ordered]@{ version = 9; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

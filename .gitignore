@@ -13,3 +13,5 @@ output/
 coverage/
 notes/private/
 *.mfa-key
+*.backup-keys
+*.backup-keys.*

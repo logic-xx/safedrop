@@ -5,6 +5,17 @@ export const b64 = (a: ArrayBuffer) => btoa(String.fromCharCode(...new Uint8Arra
 const messages: Record<string, string> = { GLOBAL_OBJECT_LIMIT: '全局文件和上传任务数量已达上限，请联系管理员', GLOBAL_STORAGE_QUOTA: '全局存储预算不足，请联系管理员或清理不再需要的文件', DISK_SPACE_LOW: '磁盘余量不足，写入已暂停；现有任务和预留保留，请联系管理员', STORAGE_UNAVAILABLE: '无法读取磁盘余量，新的写入已拒绝，请联系管理员', AUDIT_CAPACITY: '审计容量不足，操作已受保护限制，请联系部署维护者归档并调整容量', MAINTENANCE_BUSY: '服务正在创建一致备份或执行维护，请稍后重试；原任务和数据保留', BACKUP_CAPACITY: '备份份数或容量已达上限，请由部署维护者处理旧备份及未完成副本后重试', BACKUP_SOURCE_UNSAFE: '存在异常存储对象，备份未完成，请联系部署维护者检查', BACKUP_INVALID: '备份校验未通过，请检查存储和原始记录', BACKUP_PATH_UNSAFE: '备份目录不符合隔离要求，请检查部署配置', DELIVERY_UNAVAILABLE: '接收授权已失效，后续下载和续传已停止，请联系发送者', RECIPIENT_UNAVAILABLE: '接收账号不可用，请核对已注册且未停用的账号；不能发送给自己', DELIVERY_LIMIT: '有效接收授权已达上限，请先撤销不再需要的授权', UPLOAD_PREPARE_FAILED: '创建上传暂存失败，预留空间已保留，请在未完成上传中取消清理后重试', DELETE_FAILED: '磁盘清理失败，文件记录和空间占用已保留，请重试清理', FILE_DELETING: '文件已进入删除流程，下载和重命名已停止，请在文件列表重试清理', TRANSFER_CANCELING: '上传已进入取消流程，空间仍预留，请重试取消清理', FILE_BUSY: '文件正在处理，请稍后重试', FILE_COUNT_LIMIT: '文件与未完成上传数量已达上限，请先清理', TRANSFER_LIMIT: '未完成上传数量已达上限，请先完成或取消任务', ACCOUNT_DISABLED: '账号已被管理员停用，全部会话和公钥已失效', PASSWORD_CHANGED: '口令已修改，请用新口令重新登录并按需重新绑定公钥', SESSION_REVOKED: '此会话已撤销，请重新登录', INVALID_USER: '账号须为 3～32 位字母、数字、下划线或短横线，口令须为 12～256 个字符', ACCOUNT_UNAVAILABLE: '该账号不可使用，请换一个账号', INVITATION_INVALID: '邀请无效、已到期、已使用或已撤销', REGISTRATION_CLOSED: '当前已关闭自助注册，请联系管理员', LAST_ADMIN: '不能停用最后一个可用管理员', PASSWORD_UNCHANGED: '新口令不能与当前口令相同', FORBIDDEN: '此操作需要管理员权限', INVITATION_LIMIT: '待领取邀请已达上限，请先撤销不再使用的邀请', INVALID_INPUT: '输入无效，请检查后重试', INVALID_INTEGER: '数值超出允许范围', TASK_SESSION_CHANGED: '登录状态已变化，请在原账号下重新选择文件后继续', AUTH_REQUIRED: '请先登录', INVALID_CREDENTIALS: '账号或口令不正确', RATE_LIMITED: '请求过于频繁，请稍后重试', INVALID_FILENAME: '文件名包含不允许的字符', STORAGE_QUOTA: '存储配额不足', PREFIX_MISMATCH: '本地文件与服务器版本不一致，请重新下载', HASH_MISMATCH: '文件完整性校验失败', NOT_FOUND: '文件或任务不存在，或无权访问', CHALLENGE_INVALID: '认证挑战已失效', SESSION_EXPIRED: '会话已失效，请重新登录', CONNECTION_CLOSED: '连接中断，请重新登录后继续', REQUEST_TIMEOUT: '请求超时，任务可稍后恢复', TRANSFER_BUSY: '该文件正在其他任务中传输' };
 messages.REPORT_TOO_LARGE = '验证报告超过单次读取上限，请由部署维护者在本地查看完整报告';
 Object.assign(messages, {
+  BACKUP_KEY_MISSING: '备份密钥缺失，新备份已拒绝；请由部署维护者核对或恢复独立保存的密钥',
+  BACKUP_KEY_NOT_FOUND: '密钥文件不含此副本所需的旧密钥，请恢复保留该密钥的副本',
+  BACKUP_KEY_INVALID: '备份密钥文件无效，请由部署维护者恢复正确文件',
+  BACKUP_KEY_PERMISSIONS: '备份密钥权限不安全，请由部署维护者限制访问',
+  BACKUP_KEY_UNAVAILABLE: '备份密钥无法读取，请由部署维护者检查权限和配置',
+  BACKUP_KEY_PATH_UNSAFE: '备份密钥须独立于业务目录、备份目录和双因素密钥保存',
+  BACKUP_AUTH_FAILED: '备份认证未通过：密钥不匹配或副本已损坏，恢复已拒绝',
+  BACKUP_PLAINTEXT_CONFIRMATION_REQUIRED: '此副本为旧明文格式，需由部署维护者明确选择兼容校验',
+  BACKUP_SOURCE_CHANGED: '备份期间检测到源内容变化，副本未完成，请检查存储',
+  BACKUP_WRITE_FAILED: '备份写入失败，未完成副本仍占用容量，请联系部署维护者检查',
+  BACKUP_FILE_TOO_LARGE: '单个对象超过本版备份加密支持的大小，请联系部署维护者',
   MFA_REQUIRED: '请完成双因素认证后再操作',
   MFA_PASSWORD_REQUIRED: '此管理员已开启双因素认证，请使用口令加验证器验证码登录；公钥不能替代',
   MFA_INVALID: '验证码或恢复码无效。用过的验证码不能重用，请等待下一组；恢复码每份只能使用一次',

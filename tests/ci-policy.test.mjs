@@ -36,6 +36,7 @@ test('CI audit never accepts a missing or failed scanner response',()=>{
   f.production=empty(); f.all.vulnerabilities={}; assert.throws(()=>auditPolicy(f.all,f.production,f.lock,f.exceptions,now));
 });
 test('CI source policy rejects private/generated files even if added to Git',()=>{
+  for(const path of ['data.backup-keys','data.backup-keys.lock','data.backup-keys.uuid.partial']) assert.equal(safeSourcePath(path),false,path);
   for(const path of ['.local/accounts.json','tmp/fixture.ts','reports/check.json','dist/index.js','node_modules/module.js','.env','.env.production','keys/admin.mfa-key','keys/tls.key','ca.pem','data/store.sqlite','accounts.json','store.backups/manifest.json','backups/data.bin','notes/private/note.md','qa-pending-seed.json']) assert.equal(safeSourcePath(path),false,path);
   for(const path of ['.env.example','server/mfa.ts','tests/mfa-suite.ts','.github/workflows/security.yml']) assert.equal(safeSourcePath(path),true,path);
 });

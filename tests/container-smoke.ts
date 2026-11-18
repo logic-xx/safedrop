@@ -13,7 +13,7 @@ import { digest, type Checkpoint } from '../server/store.ts';
 type Account = { name: string; password: string };
 type AccountState = { userId: string; name: string; password: string; token: string; keyId: string };
 type DeliveryState = { active: string; revoked: string; recipientQuota: Metadata };
-type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata; delivery: DeliveryState; backupId: string };
+type State = { seed: string; name: string; sha256: string; fileId: string; transferId: string; checkpoint: Checkpoint; account: AccountState; quota: Metadata; delivery: DeliveryState; backupId: string; backupKeyId: string };
 export interface ContainerCheckOptions { origin: string; ca: Buffer; accounts: Account[]; statePath: string; phase: 'seed' | 'resume' }
 
 class Peer {
@@ -195,7 +195,9 @@ export async function checkContainer(options: ContainerCheckOptions) {
       const maintenance = (await admin.rpc('maintenance.status')).meta;
       assert.ok(Number((maintenance.storage as Metadata).used) > 0); assert.equal(maintenance.cleanupAutomatic, false);
       const backup = await admin.rpc('maintenance.backup'); assert.match(String(backup.meta.id), /^backup-[0-9a-f-]{36}$/);
-      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota, delivery, backupId: String(backup.meta.id) };
+      assert.equal(backup.meta.encrypted, true); assert.equal((maintenance.backupEncryption as Metadata).configured, true); assert.equal(backup.meta.keyId, (maintenance.backupEncryption as Metadata).activeKeyId);
+      const state: State = { seed, name, sha256, fileId, transferId: String(partial.meta.id), checkpoint, account, quota, delivery, backupId: String(backup.meta.id), backupKeyId: String(backup.meta.keyId) };
+      checks.push('New backup is encrypted with the configured independent key');
       checks.push('Global storage and audit status are admin-only; quiescent backup completed without granting file access');
       writeFileSync(statePath, JSON.stringify(state, null, 2));
       checks.push('Upload/download SHA-256 and cross-user access denial', 'Persistent partial upload and independent audit checkpoint prepared');
@@ -224,6 +226,7 @@ export async function checkContainer(options: ContainerCheckOptions) {
       checks.push('Active/revoked delivery grants survive restart and recipient quota remains unchanged');
       const maintenance = (await admin.rpc('maintenance.status')).meta;
       assert.ok((maintenance.backups as { id: string }[]).some(b => b.id === state.backupId));
+      const retained = (maintenance.backups as Metadata[]).find(backup => backup.id === state.backupId)!; assert.equal(retained.encrypted, true); assert.equal(retained.keyId, state.backupKeyId); assert.equal((maintenance.backupEncryption as Metadata).activeKeyId, state.backupKeyId);
       checks.push('Maintenance policy and verified backup metadata survive restart');
       checks.push('Disabled account, deleted key and consumed invitation stay invalid across restart');
       checks.push('Generated accounts, completed file, renamed filename and quota values survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');

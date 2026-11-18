@@ -23,7 +23,7 @@ export function auditPolicy(all, production, lock, exceptions, now = Date.now())
   return { ok, status: !ok ? 'failed' : accepted.length ? 'accepted-risk' : 'passed', all: totals, production: prod, accepted, blocked };
 }
 export function safeSourcePath(path) {
-  return !/(^|\/)(\.local|tmp|reports|output|dist|build|node_modules|\.git|backups?|[^/]+\.backups|notes\/private)(\/|$)|(^|\/)(accounts|state|qa-[^/]+)\.json$|(^|\/)\.env(?:\..*)?$|\.(?:mfa-key|sqlite3?(?:-wal|-shm)?|db|pem|key|p12|pfx)$/i.test(path) || path === '.env.example';
+  return !/(^|\/)(\.local|tmp|reports|output|dist|build|node_modules|\.git|backups?|[^/]+\.backups|notes\/private)(\/|$)|(^|\/)(accounts|state|qa-[^/]+)\.json$|(^|\/)\.env(?:\..*)?$|\.(?:mfa-key|backup-keys(?:\.[^/]*)?|sqlite3?(?:-wal|-shm)?|db|pem|key|p12|pfx)$/i.test(path) || path === '.env.example';
 }
 export function imagePolicy(report) {
   assert.ok(report.SchemaVersion === 2 && report.ArtifactType === 'container_image' && typeof report.ArtifactName === 'string' && typeof report.Metadata?.OS?.Family === 'string' && /^sha256:[a-f0-9]{64}$/.test(report.Metadata?.ImageID ?? '') && Array.isArray(report.Results) && report.Results.length > 0, 'INVALID_IMAGE_REPORT_OR_MISSING_PACKAGE_INVENTORY');

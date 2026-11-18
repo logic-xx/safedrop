@@ -8,8 +8,10 @@ import { randomBytes, generateKeyPairSync } from 'node:crypto';
 import { WebSocket } from 'ws';
 import { DatabaseSync } from 'node:sqlite';
 import { createApp, type Config } from '../server/app.ts';
-import { digest, Store, verifyAudit } from '../server/store.ts';
+import { digest, Store, verifyAudit, type Checkpoint } from '../server/store.ts';
 import { verifyBackup, restoreBackup, createBackup } from '../server/backup.ts';
+import { changeBackupKeys, readBackupKeys } from '../server/backup-keys.ts';
+import { BackupCipher, newBackupHeader } from '../server/backup-crypto.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer, type Result } from './suite.ts';
 import { CHUNK } from '../shared/protocol.ts';
@@ -20,6 +22,7 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
   const ca = readFileSync(join(root, 'tls/ca.crt')), tls = { cert: readFileSync(join(root, 'tls/server.crt')), key: readFileSync(join(root, 'tls/server.key')) }, pass = randomBytes(24).toString('base64url'), results: Result[] = [];
   async function fixture() {
     const config: Config = { root: mkdtempSync(join(root, 'data-')), origin: 'https://localhost', tls, loginLimit: 1000, normalRate: CHUNK * 64, storage: { globalQuota: 1024 ** 2, minFree: 0, staleMs: 10000 } };
+    const keyFile = config.root + '.backup-keys'; await changeBackupKeys(keyFile);
     let app = createApp(config); const ids: Record<string, string> = {};
     for (const name of ['owner', 'reader', 'admin']) ids[name] = await app.store.addUser(name, pass, name === 'admin' ? 'admin' : 'user');
     const start = async () => { app.storage.free = () => 1024 ** 3; app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening'); }; await start();
@@ -28,7 +31,9 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
     const owner = await login('owner'), reader = await login('reader'), admin = await login('admin');
     const upload = async (bytes: Buffer, p = owner, complete = true) => { const id = String((await p.rpc('upload.init', { name: '维护样本.bin', size: bytes.length, sha256: digest(bytes) })).meta.id); if (bytes.length) await p.rpc('upload.chunk', { transferId: id, offset: 0 }, bytes); if (complete) await p.rpc('upload.finish', { transferId: id }); return id; };
     const expire = (id: string) => app.store.run('UPDATE transfer_activity SET touched=0 WHERE id=?', id);
-    return { config, ids, owner, reader, admin, connect, login, upload, expire, get app() { return app; }, backupRoot: config.root + '.backups',
+    return { config, ids, owner, reader, admin, connect, login, upload, expire, keyFile, get app() { return app; }, backupRoot: config.root + '.backups',
+      verifyBackup: (source: string, anchor?: Checkpoint) => verifyBackup(source, anchor, { keyFile }),
+      restoreBackup: (source: string, target: string, anchor?: Checkpoint) => restoreBackup(source, target, anchor, { keyFile }),
       async restart() { await app.close(); app = createApp(config); await start(); },
       async close() { assert.equal(verifyAudit(app.store.all('SELECT * FROM audit ORDER BY seq')).ok, true); assert.equal(JSON.stringify(app.store.all('SELECT * FROM audit')).includes(pass), false); await app.close(); }
     };
@@ -144,9 +149,10 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
   await run('一致备份：数据库、对象、部分上传、授权和链段可完整校验', async f => {
     const id = await f.upload(Buffer.alloc(43)), partial = await f.upload(Buffer.alloc(17), f.owner, false);
     const delivery = (await f.owner.rpc('deliveries.create', { fileId: id, recipient: 'reader' })).meta.deliveryId, anchor = f.app.store.checkpoint();
-    const result = await f.admin.rpc('maintenance.backup'), source = join(f.backupRoot, String(result.meta.id)), manifest = await verifyBackup(source, anchor);
+    const result = await f.admin.rpc('maintenance.backup'), source = join(f.backupRoot, String(result.meta.id)), manifest = await f.verifyBackup(source, anchor);
     assert.ok(manifest.entries.some(e => e.path === 'objects/' + id)); assert.ok(manifest.entries.some(e => e.path === 'staging/' + partial));
-    const db = new DatabaseSync(join(source, 'safedrop.sqlite'), { readOnly: true }); try { assert.equal(db.prepare('SELECT revoked FROM deliveries WHERE id=?').get(String(delivery))!.revoked, 0); } finally { db.close(); }
+    const view = join(root, 'backup-view-' + crypto.randomUUID()); await f.restoreBackup(source, view, anchor);
+    const db = new DatabaseSync(join(view, 'safedrop.sqlite'), { readOnly: true }); try { assert.equal(db.prepare('SELECT revoked FROM deliveries WHERE id=?').get(String(delivery))!.revoked, 0); } finally { db.close(); }
     assert.equal(f.app.store.all('SELECT * FROM audit').length > manifest.checkpoint.count, true);
   });
   await run('备份互斥：等在途写入完成，期间拒绝新业务并随后恢复', async f => {
@@ -157,7 +163,8 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
     const copying = f.admin.rpc('maintenance.backup');
     try { const admin2 = await f.connect(); await assert.rejects(admin2.rpc('auth.password', { name: 'admin', password: pass }), /MAINTENANCE_BUSY/); }
     finally { release(); }
-    await writing; const result = await copying, db = new DatabaseSync(join(f.backupRoot, String(result.meta.id), 'safedrop.sqlite'), { readOnly: true });
+    await writing; const result = await copying, view = join(root, 'barrier-view-' + crypto.randomUUID()); await f.restoreBackup(join(f.backupRoot, String(result.meta.id)), view);
+    const db = new DatabaseSync(join(view, 'safedrop.sqlite'), { readOnly: true });
     try { assert.equal(db.prepare('SELECT offset FROM transfers WHERE id=?').get(id)!.offset, bytes.length); } finally { db.close(); }
     assert.equal((await f.owner.rpc('files.list')).meta.ok, true);
   });
@@ -179,8 +186,8 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
   await run('隔离恢复：新目录保留账号、内容、任务偏移、授权及审计检查点', async f => {
     const bytes = Buffer.from('恢复内容'), id = await f.upload(bytes), pending = await f.upload(Buffer.alloc(23), f.owner, false);
     const deliveryId = String((await f.owner.rpc('deliveries.create', { fileId: id, recipient: 'reader' })).meta.deliveryId);
-    const result = await f.admin.rpc('maintenance.backup'), source = join(f.backupRoot, String(result.meta.id)), manifest = await verifyBackup(source), target = join(root, 'restored-' + crypto.randomUUID());
-    await restoreBackup(source, target, manifest.checkpoint); const store = new Store(target);
+    const result = await f.admin.rpc('maintenance.backup'), source = join(f.backupRoot, String(result.meta.id)), manifest = await f.verifyBackup(source), target = join(root, 'restored-' + crypto.randomUUID());
+    await f.restoreBackup(source, target, manifest.checkpoint); const store = new Store(target);
     try { assert.deepEqual(store.get('SELECT hash FROM users WHERE id=?', f.ids.owner), f.app.store.get('SELECT hash FROM users WHERE id=?', f.ids.owner)); assert.equal(store.get('SELECT offset FROM transfers WHERE id=?', pending)!.offset, 23); assert.equal(store.get('SELECT revoked FROM deliveries WHERE id=?', deliveryId)!.revoked, 0); assert.equal(verifyAudit(store.all('SELECT * FROM audit ORDER BY seq'), manifest.checkpoint).ok, true); assert.equal(digest(readFileSync(join(target, 'objects', id))), digest(bytes)); } finally { store.close(); }
     const restored = createApp({ ...f.config, root: target }); restored.server.listen(0, '127.0.0.1'); await once(restored.server, 'listening');
     try {
@@ -190,13 +197,16 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
       await owner.rpc('upload.finish', { transferId: pending });
       assert.equal(digest((await reader.rpc('download.chunk', { fileId: id, deliveryId, offset: 0 })).payload), digest(bytes));
     } finally { await restored.close(); }
-    await assert.rejects(restoreBackup(source, target), /EEXIST/);
+    await assert.rejects(f.restoreBackup(source, target), /EEXIST/);
   });
   await run('恢复拒绝：损坏内容、伪造路径和独立检查点不匹配均不创建目标', async f => {
     const id = await f.upload(Buffer.from('content')), result = await f.admin.rpc('maintenance.backup'), source = join(f.backupRoot, String(result.meta.id)), target = join(root, 'invalid-' + crypto.randomUUID());
-    await assert.rejects(restoreBackup(source, target, { count: 1, head: 'f'.repeat(64) }), /AUDIT_INTEGRITY_FAILURE/); assert.equal(existsSync(target), false);
-    writeFileSync(join(source, 'objects', id), 'changed'); await assert.rejects(restoreBackup(source, target), /BACKUP_HASH_MISMATCH/); assert.equal(existsSync(target), false);
-    const path = join(source, 'manifest.json'), m = JSON.parse(readFileSync(path, 'utf8')); m.entries[0].path = '../escape'; writeFileSync(path, JSON.stringify(m)); await assert.rejects(verifyBackup(source), /BACKUP_INVALID/);
+    await assert.rejects(f.restoreBackup(source, target, { count: 1, head: 'f'.repeat(64) }), /AUDIT_INTEGRITY_FAILURE/); assert.equal(existsSync(target), false);
+    const manifest = await f.verifyBackup(source), index = manifest.entries.findIndex(entry => entry.path === 'objects/' + id) + 1, blob = join(source, 'sealed', String(index).padStart(6, '0') + '.bin'), original = readFileSync(blob), changed = Buffer.from(original); changed[0] ^= 1; writeFileSync(blob, changed);
+    await assert.rejects(f.restoreBackup(source, target), /BACKUP_AUTH_FAILED/); assert.equal(existsSync(target), false); writeFileSync(blob, original);
+    manifest.entries[0].path = '../escape'; const header = newBackupHeader(manifest.id, manifest.created, await readBackupKeys(f.keyFile)), cipher = new BackupCipher(header, await readBackupKeys(f.keyFile));
+    try { writeFileSync(join(source, 'manifest.json'), JSON.stringify({ ...header, bytes: manifest.storedBytes, sealed: cipher.seal(0, 'manifest', Buffer.from(JSON.stringify(manifest))).toString('base64') })); } finally { cipher.dispose(); }
+    await assert.rejects(f.verifyBackup(source), /BACKUP_INVALID/);
   });
   await run('恢复中断：标记未完成的目录拒绝作为业务存储启动', async f => {
     const target = mkdtempSync(join(root, 'interrupted-')); writeFileSync(join(target, '.restore-incomplete'), '{}'); assert.throws(() => new Store(target), /RESTORE_INCOMPLETE/);
@@ -204,10 +214,10 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
   });
   await run('恢复写入失败：隔离目录保留未完成标记，原存储和备份不变', async f => {
     const id = await f.upload(Buffer.from('original')), result = await f.admin.rpc('maintenance.backup'), source = join(f.backupRoot, String(result.meta.id)), target = join(root, 'restore-failure-' + crypto.randomUUID());
-    const original = fsPromises.copyFile; fsPromises.copyFile = async (...args) => { if (String(args[1]) === join(target, 'objects', id)) throw Object.assign(new Error('write failed'), { code: 'ENOSPC' }); return original(...args); }; syncBuiltinESMExports();
-    try { await assert.rejects(restoreBackup(source, target), /write failed/); assert.ok(existsSync(join(target, '.restore-incomplete'))); assert.throws(() => new Store(target), /RESTORE_INCOMPLETE/); }
-    finally { fsPromises.copyFile = original; syncBuiltinESMExports(); }
-    assert.equal(readFileSync(join(f.config.root, 'objects', id), 'utf8'), 'original'); await verifyBackup(source);
+    const original = fsPromises.open; fsPromises.open = async (...args) => { const handle = await original(...args); if (String(args[0]) === join(target, 'objects', id)) handle.writeFile = async () => { throw Object.assign(new Error('write failed'), { code: 'ENOSPC' }); }; return handle; }; syncBuiltinESMExports();
+    try { await assert.rejects(f.restoreBackup(source, target), /write failed/); assert.ok(existsSync(join(target, '.restore-incomplete'))); assert.throws(() => new Store(target), /RESTORE_INCOMPLETE/); }
+    finally { fsPromises.open = original; syncBuiltinESMExports(); }
+    assert.equal(readFileSync(join(f.config.root, 'objects', id), 'utf8'), 'original'); await f.verifyBackup(source);
   });
   await run('写入故障：短写可补全，零写入与 sync 失败均不推进确认偏移', async f => {
     const bytes = Buffer.alloc(37), original = fsPromises.open;

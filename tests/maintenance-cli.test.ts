@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { createApp } from '../server/app.ts';
@@ -17,12 +17,21 @@ test('host maintenance CLI enforces TLS and stores independent checkpoints witho
   const accounts = join(root, 'accounts.json'), destination = join(root, 'independent'); writeFileSync(accounts, JSON.stringify([{ name: 'admin', password }]), { mode: 0o600 });
   const run = (command: string, extra: string[] = [], origin = config.origin) => promisify(execFile)(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'scripts/maintenance.ts', command, '--origin', origin, '--ca', join(root, 'tls/ca.crt'), '--accounts', accounts, ...extra], { windowsHide: true, timeout: 30000 });
   try {
+    const keyFile = config.root + '.backup-keys';
+    const initialized = await run('keys-init', ['--key-file', keyFile, '--backup-dir', config.root + '.backups']); assert.equal(JSON.parse(initialized.stdout).retainedKeys, 1);
     const result = await run('anchor', ['--destination', destination]), saved = JSON.parse(result.stdout); assert.equal(saved.saved, true); assert.equal(result.stdout.includes(password), false); assert.equal(result.stderr.includes(password), false);
     const paths = readdirSync(destination); assert.equal(paths.length, 1); const anchor = JSON.parse(readFileSync(join(destination, paths[0]), 'utf8')); assert.deepEqual(anchor, { count: saved.count, head: saved.head });
     assert.equal(existsSync(join(config.root, paths[0])), false);
     const backup = JSON.parse((await run('backup')).stdout); const source = config.root + '.backups/' + backup.id, target = join(root, 'restored');
-    assert.equal(JSON.parse((await run('verify', ['--source', source, '--anchor', join(destination, paths[0])])).stdout).verified, true);
-    assert.equal(JSON.parse((await run('restore', ['--source', source, '--target', target, '--anchor', join(destination, paths[0])])).stdout).id, backup.id);
+    assert.equal(backup.encrypted, true);
+    assert.equal(JSON.parse((await run('verify', ['--source', source, '--anchor', join(destination, paths[0]), '--key-file', keyFile])).stdout).verified, true);
+    assert.equal(JSON.parse((await run('restore', ['--source', source, '--target', target, '--anchor', join(destination, paths[0]), '--key-file', keyFile])).stdout).id, backup.id);
+    const keyMaterial = JSON.parse(readFileSync(keyFile, 'utf8')).keys[0].material, status = await run('keys-status', ['--key-file', keyFile]); assert.equal(status.stdout.includes(keyMaterial), false); assert.equal(status.stderr.includes(keyMaterial), false);
+    const rotated = JSON.parse((await run('keys-rotate', ['--key-file', keyFile])).stdout); assert.equal(rotated.retainedKeys, 2);
+    assert.equal(JSON.parse((await run('verify', ['--source', source, '--key-file', keyFile])).stdout).verified, true);
+    renameSync(keyFile, keyFile + '.saved');
+    try { await assert.rejects(run('keys-init', ['--key-file', keyFile, '--backup-dir', config.root + '.backups']), /BACKUP_KEY_RESTORE_REQUIRED/); assert.equal(existsSync(keyFile), false); }
+    finally { renameSync(keyFile + '.saved', keyFile); }
     await assert.rejects(run('status', [], config.origin.replace('https:', 'http:')), /HTTPS_REQUIRED/);
     await assert.rejects(run('anchor', ['--destination', join(root, 'invalid'), '--interval-seconds', '0']), /INVALID_INTERVAL/); assert.equal(existsSync(join(root, 'invalid')), false);
     const secret = randomBytes(20), adminId = app.store.get('SELECT id FROM users WHERE name=?', 'admin')!.id, guard = new MfaGuard(app.store, config.root + '.mfa-key');

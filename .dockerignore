@@ -12,3 +12,7 @@ reports
 notes
 *.mfa-key
 **/*.mfa-key
+*.backup-keys
+*.backup-keys.*
+**/*.backup-keys
+**/*.backup-keys.*

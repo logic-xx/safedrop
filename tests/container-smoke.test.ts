@@ -8,6 +8,7 @@ import { createServer } from 'node:https';
 import { createApp } from '../server/app.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { checkContainer } from './container-smoke.ts';
+import { changeBackupKeys } from '../server/backup-keys.ts';
 
 test('deployment verifier checks real HTTPS/WSS and persistence across service restart', { timeout: 60000 }, async () => {
   mkdirSync('tmp', { recursive: true }); const root = mkdtempSync(resolve('tmp/container-verifier-'));
@@ -25,6 +26,7 @@ test('deployment verifier checks real HTTPS/WSS and persistence across service r
     await assert.rejects(checkContainer({ origin: `https://localhost:${duplicatePort}`, ca, accounts: [], statePath: join(root, 'unused.json'), phase: 'seed' }), /Expected exactly one HSTS response header/);
   } finally { await new Promise<void>((resolve, reject) => duplicateHeaderServer.close(error => error ? reject(error) : resolve())); }
   // Select an available local port before fixing the origin used by the service.
+  await changeBackupKeys(join(root, 'data') + '.backup-keys');
   let app = createApp({ root: join(root, 'data'), origin: 'https://localhost', tls });
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening');
   const port = (app.server.address() as { port: number }).port; await app.close();

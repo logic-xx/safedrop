@@ -9,6 +9,7 @@ import { createApp, type Config } from '../server/app.ts';
 import { Store, digest, verifyAudit } from '../server/store.ts';
 import { MfaGuard, unbase32, totp } from '../server/mfa.ts';
 import { verifyBackup, restoreBackup } from '../server/backup.ts';
+import { changeBackupKeys } from '../server/backup-keys.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer, type Result } from './suite.ts';
 
@@ -164,8 +165,9 @@ export async function runMfaSuite(onResult?: (r: Result) => void) {
     }
   });
   await run('MFA 备份恢复：保留加密配置和消费状态，缺少独立密钥时拒绝启动', async f => {
-    const { secret } = await f.enable(), backup = await f.admin.rpc('maintenance.backup'), source = join(f.config.root + '.backups', String(backup.meta.id)), target = join(root, 'restored-' + crypto.randomUUID());
-    const manifest = await verifyBackup(source); assert.ok(manifest.entries.every(e => !e.path.includes('mfa-key'))); await restoreBackup(source, target, manifest.checkpoint);
+    const { secret } = await f.enable(), backupKeysFile = f.config.root + '.backup-keys'; await changeBackupKeys(backupKeysFile);
+    const backup = await f.admin.rpc('maintenance.backup'), source = join(f.config.root + '.backups', String(backup.meta.id)), target = join(root, 'restored-' + crypto.randomUUID());
+    const manifest = await verifyBackup(source, undefined, { keyFile: backupKeysFile }); assert.ok(manifest.entries.every(e => !e.path.includes('mfa-key') && !e.path.includes('backup-keys'))); await restoreBackup(source, target, manifest.checkpoint, { keyFile: backupKeysFile });
     assert.throws(() => createApp({ ...f.config, root: target }), /MFA_KEY_UNAVAILABLE/);
     const keyFile = target + '.mfa-key'; writeFileSync(keyFile, randomBytes(32), { mode: 0o600 }); assert.throws(() => createApp({ ...f.config, root: target }), /MFA_KEY_UNAVAILABLE/);
     copyFileSync(f.config.root + '.mfa-key', keyFile); const restored = createApp({ ...f.config, root: target }); restored.server.listen(0, '127.0.0.1'); await once(restored.server, 'listening');
