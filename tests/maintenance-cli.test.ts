@@ -8,6 +8,7 @@ import { resolve, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { createApp } from '../server/app.ts';
 import { certificates } from '../scripts/certificates.ts';
+import { MfaGuard, totp } from '../server/mfa.ts';
 
 test('host maintenance CLI enforces TLS and stores independent checkpoints without exposing credentials', { timeout: 45000 }, async () => {
   mkdirSync('tmp', { recursive: true }); const root = mkdtempSync(resolve('tmp/maintenance-cli-')); certificates(join(root, 'tls'));
@@ -24,5 +25,11 @@ test('host maintenance CLI enforces TLS and stores independent checkpoints witho
     assert.equal(JSON.parse((await run('restore', ['--source', source, '--target', target, '--anchor', join(destination, paths[0])])).stdout).id, backup.id);
     await assert.rejects(run('status', [], config.origin.replace('https:', 'http:')), /HTTPS_REQUIRED/);
     await assert.rejects(run('anchor', ['--destination', join(root, 'invalid'), '--interval-seconds', '0']), /INVALID_INTERVAL/); assert.equal(existsSync(join(root, 'invalid')), false);
+    const secret = randomBytes(20), adminId = app.store.get('SELECT id FROM users WHERE name=?', 'admin')!.id, guard = new MfaGuard(app.store, config.root + '.mfa-key');
+    guard.now = () => Date.now() - 30000; const enable = guard.enroll(adminId, secret, totp(secret, Date.now() - 30000)); app.store.transaction(enable);
+    await assert.rejects(run('status'), /MFA_OTP_FILE_REQUIRED/);
+    const otpFile = join(root, 'current-otp.txt'), currentCode = totp(secret); writeFileSync(otpFile, currentCode, { mode: 0o600 });
+    const protectedResult = await run('status', ['--otp-file', otpFile]); assert.ok(JSON.parse(protectedResult.stdout).storage);
+    assert.equal(protectedResult.stdout.includes(currentCode), false); assert.equal(protectedResult.stderr.includes(currentCode), false);
   } finally { await app.close(); }
 });

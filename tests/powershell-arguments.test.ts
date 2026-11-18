@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 test('Windows PowerShell forwards Node eval source as one native argument', { skip: process.platform !== 'win32' }, () => {
   // Use the actual Docker wrapper with Node as an isolated argument receiver.
@@ -24,6 +25,9 @@ Invoke-DockerChecked -DockerArgs $nativeArgs
   assert.deepEqual(JSON.parse(result.trim()), ['spaces, quotes and a dollar $x', 'two words', 'sd1_disposable']);
 });
 test('Windows PowerShell preserves SQL quotes and Unicode in module source over stdin', { skip: process.platform !== 'win32' }, () => {
+  // The additional Docker CLI hop may use a legacy code page even when Node
+  // receives UTF-8 directly. The real MFA probe must survive ASCII transport.
+  assert.ok(/^[\x00-\x7f]*$/.test(readFileSync('tests/container-mfa.mjs', 'utf8')), 'Container MFA stdin source must be ASCII-only');
   const script = String.raw`
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object System.Text.UTF8Encoding($false)

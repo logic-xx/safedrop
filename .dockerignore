@@ -10,3 +10,5 @@ reports
 *.log
 .env
 notes
+*.mfa-key
+**/*.mfa-key

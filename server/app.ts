@@ -11,9 +11,10 @@ import { Bandwidth, RateGate } from './limits.ts';
 import { createHash } from 'node:crypto';
 import { StorageGuard, type StoragePolicy } from './storage.ts';
 import { backupList, createBackup } from './backup.ts';
+import { MfaGuard, base32, type MfaProof } from './mfa.ts';
 
-export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy }
-interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number } }
+export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number }
+interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
 }
@@ -28,7 +29,11 @@ async function hashFile(path: string, bytes?: number, signal?: AbortSignal) {
 }
 export function createApp(config: Config) {
   const store = new Store(config.root, config.storage?.auditLimit ?? 64 * 1024 ** 2);
-  const storage = new StorageGuard(store, config.storage ?? {}), backupRoot = resolve(config.storage?.backupRoot ?? config.root + '.backups');
+  const backupRoot = resolve(config.storage?.backupRoot ?? config.root + '.backups');
+  let mfa: MfaGuard;
+  try { mfa = new MfaGuard(store, resolve(config.mfaKeyFile ?? config.root + '.mfa-key'), config.mfaClock, backupRoot); }
+  catch (e) { store.close(); throw e; }
+  const storage = new StorageGuard(store, config.storage ?? {});
   need(verifyAudit(store.all('SELECT * FROM audit ORDER BY seq')).ok, 'AUDIT_INTEGRITY_FAILURE');
   store.run('UPDATE sessions SET revoked=1 WHERE revoked=0');
   const rate = new RateGate(), bw = new Bandwidth(config.normalRate, config.vipRate);
@@ -36,7 +41,7 @@ export function createApp(config: Config) {
   const operations = new Set<Promise<void>>();
   const activeDispatches = new Set<Promise<unknown>>();
   let maintenanceBusy = false, cleanupBusy = false, auditReserved = 0;
-  const readOnly = new Set(['hello', 'ping', 'files.list', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status']);
+  const readOnly = new Set(['hello', 'ping', 'files.list', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
   type DownloadJob = { abort: AbortController; done: Promise<void>; userId: string; ownerId: string; deliveryId?: string };
   const downloads = new Map<string, Set<DownloadJob>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
@@ -67,35 +72,58 @@ export function createApp(config: Config) {
     wss.handleUpgrade(req, socket, head, ws => { req.socket.setTimeout(0); wss.emit('connection', ws, req); });
   });
   const audit = (c: Context, action: string, result: string, detail: Record<string, unknown> = {}) => store.audit(c.user?.name ?? 'anonymous', action, result, detail);
-  function authorized(c: Context) {
+  function authorized(c: Context, recoveryAllowed = false) {
     need(!c.abort.signal.aborted && c.user && c.session, 'AUTH_REQUIRED');
     const s = store.get('SELECT * FROM sessions WHERE id=?', c.session);
     const u = store.get('SELECT * FROM users WHERE id=?', c.user.id);
     need(s && !s.revoked && s.expires > Date.now() && u && !u.disabled, 'SESSION_EXPIRED');
+    if (u.role === 'admin' && mfa.enabled(u.id)) {
+      const factor = mfa.factor(s.id, u.id, u.authVersion); need(factor, 'MFA_REQUIRED');
+      need(recoveryAllowed || factor !== 'recovery', 'MFA_RECOVERY_ONLY');
+    }
     c.user = u; return u;
   }
   const admin = (c: Context) => need(authorized(c).role === 'admin', 'FORBIDDEN');
-  function stopUser(userId: string, reason: string, replyContext?: Context) {
+  function stopUser(userId: string, reason: string, replyContext?: Context, keepReply = false) {
     for (const ctx of contexts) {
       if (ctx.challenge?.key.userId === userId) ctx.challenge = undefined;
+      if (ctx.mfaLogin?.userId === userId) ctx.mfaLogin = undefined;
       if (ctx.user?.id !== userId) continue;
+      if (ctx.mfaSetup) { ctx.mfaSetup.secret.fill(0); ctx.mfaSetup = undefined; }
+      if (ctx === replyContext && keepReply) continue;
       const stop = () => { ctx.abort.abort(); ctx.ws.close(4001, reason); };
       // The database is already revoked; allow only this operation's acknowledgement.
       if (ctx === replyContext) setTimeout(stop, 10); else stop();
     }
   }
-  function establish(c: Context, u: Row, method: string) {
+  function establish(c: Context, u: Row, method: string, proof?: MfaProof) {
     need(!c.user, 'ALREADY_AUTHENTICATED');
     const current = store.get('SELECT * FROM users WHERE id=?', u.id);
     need(current && !current.disabled && current.authVersion === u.authVersion, 'INVALID_CREDENTIALS');
+    const enabled = current.role === 'admin' && mfa.enabled(current.id); need(!enabled || proof, 'MFA_PASSWORD_REQUIRED');
     need(store.get('SELECT COUNT(*) AS n FROM sessions WHERE userId=? AND revoked=0 AND expires>?', u.id, Date.now())!.n < 8, 'SESSION_LIMIT');
     const session = id();
     store.transaction(() => {
-      store.run('INSERT INTO sessions VALUES(?,?,?,?,0,?,?)', session, u.id, Date.now(), Date.now() + (config.sessionMs ?? 3600000), c.agent, c.ip);
+      proof?.consume();
+      store.run('INSERT INTO sessions VALUES(?,?,?,?,0,?,?)', session, u.id, Date.now(), Date.now() + Math.min(config.sessionMs ?? 3600000, proof?.method === 'recovery' ? 300000 : Number.MAX_SAFE_INTEGER), c.agent, c.ip);
+      if (proof) store.run('INSERT INTO mfa_sessions VALUES(?,?,?,?)', session, u.id, u.authVersion, proof.method);
       store.audit(u.name, 'auth.login', 'allowed', { method });
     });
     c.user = u; c.session = session;
-    return { user: { name: u.name, role: u.role, tier: u.tier, rate: bw.rate(u.tier) }, session: c.session, connection: c.connection };
+    return { user: { name: u.name, role: u.role, tier: u.tier, rate: bw.rate(u.tier), mfaEnabled: enabled, recoveryOnly: proof?.method === 'recovery' }, session: c.session, connection: c.connection };
+  }
+  function upgradeFactor(c: Context, u: Row, enabled: boolean) {
+    store.run('UPDATE users SET authVersion=authVersion+1 WHERE id=?', u.id);
+    store.run('UPDATE sessions SET revoked=1 WHERE userId=? AND id<>?', u.id, c.session!);
+    store.run('DELETE FROM keys WHERE userId=?', u.id);
+    if (enabled) store.run("INSERT INTO mfa_sessions VALUES(?,?,?,'totp') ON CONFLICT(sessionId) DO UPDATE SET authVersion=excluded.authVersion,method='totp'", c.session!, u.id, u.authVersion + 1);
+    else store.run('DELETE FROM mfa_sessions WHERE userId=?', u.id);
+  }
+  async function mfaPassword(c: Context, u: Row, value: unknown) {
+    need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED'); authenticating++;
+    try { need(await passwordCheck(text(value, 256), u.hash), 'INVALID_CREDENTIALS'); }
+    finally { authenticating--; }
+    need(authorized(c, true).authVersion === u.authVersion, 'SESSION_EXPIRED');
   }
   function owned(c: Context, table: 'transfers' | 'files', transferId: unknown) {
     const u = authorized(c); const row = store.get(`SELECT * FROM ${table} WHERE id=? AND userId=?`, text(transferId, 80), u.id); need(row, 'NOT_FOUND'); return row;
@@ -228,12 +256,31 @@ export function createApp(config: Config) {
         const name = text(m.name, 64), pass = text(m.password, 256), u = store.get('SELECT * FROM users WHERE name=?', name);
         // A dummy hash performs equivalent work for unknown accounts.
         const valid = await passwordCheck(pass, u?.hash ?? ('0'.repeat(32) + ':' + '0'.repeat(64)));
-        need(u && valid, 'INVALID_CREDENTIALS'); c.abort.signal.throwIfAborted(); return { meta: establish(c, u, 'password') };
+        need(u && valid, 'INVALID_CREDENTIALS'); c.abort.signal.throwIfAborted();
+        const current = store.get('SELECT * FROM users WHERE id=?', u.id);
+        need(current && !current.disabled && current.authVersion === u.authVersion, 'INVALID_CREDENTIALS');
+        if (current.role === 'admin' && mfa.enabled(current.id)) {
+          mfa.checkLimit(current.id); c.challenge = undefined;
+          c.mfaLogin = { userId: current.id, authVersion: current.authVersion, id: id(), expires: mfa.now() + 120000, attempts: 0 };
+          return { meta: { mfaRequired: true, challenge: c.mfaLogin.id, expires: c.mfaLogin.expires } };
+        }
+        return { meta: establish(c, current, 'password') };
       } finally { authenticating--; }
+    }
+    if (op === 'auth.mfa') {
+      need(!c.user, 'ALREADY_AUTHENTICATED'); const pending = c.mfaLogin;
+      need(pending && pending.id === m.challenge && pending.expires > mfa.now() && pending.attempts < 5, 'MFA_CHALLENGE_INVALID');
+      need(rate.allow('mfa-ip:' + c.ip, 30, 300000), 'MFA_RATE_LIMITED'); pending.attempts++;
+      const u = store.get('SELECT * FROM users WHERE id=?', pending.userId);
+      need(u && !u.disabled && u.role === 'admin' && u.authVersion === pending.authVersion && mfa.enabled(u.id), 'MFA_CHALLENGE_INVALID');
+      need((m.code !== undefined) !== (m.recoveryCode !== undefined), 'INVALID_INPUT');
+      const proof = mfa.proof(u.id, m.recoveryCode ?? m.code, m.recoveryCode !== undefined);
+      const result = establish(c, u, 'password+' + proof.method, proof); c.mfaLogin = undefined; return { meta: result };
     }
     if (op === 'auth.challenge') {
       need(!c.user && rate.allow('challenge:' + c.ip, 30), 'RATE_LIMITED');
       const key = store.get('SELECT k.*,u.name FROM keys k JOIN users u ON u.id=k.userId WHERE k.id=? AND u.name=? AND u.disabled=0', text(m.keyId, 80), text(m.name, 64));
+      if (key) need(!mfa.enabled(key.userId), 'MFA_PASSWORD_REQUIRED');
       need(key, 'INVALID_CREDENTIALS'); const expires = Date.now() + 30000;
       const message = JSON.stringify(['SFT/1 AUTH', c.connection, key.name, key.id, randomBytes(32).toString('base64url'), expires]);
       c.challenge = { key, message, expires }; return { meta: { message, expires } };
@@ -242,11 +289,45 @@ export function createApp(config: Config) {
       const challenge = c.challenge; c.challenge = undefined;
       need(challenge && challenge.expires > Date.now(), 'CHALLENGE_INVALID');
       need(store.get('SELECT id FROM keys WHERE id=?', challenge.key.id), 'CHALLENGE_INVALID');
+      need(!mfa.enabled(challenge.key.userId), 'MFA_PASSWORD_REQUIRED');
       const publicKey = createPublicKey({ key: JSON.parse(challenge.key.jwk), format: 'jwk' });
       need(verify('sha256', Buffer.from(challenge.message), { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(text(m.signature, 256), 'base64')), 'INVALID_SIGNATURE');
       return { meta: establish(c, store.get('SELECT * FROM users WHERE id=?', challenge.key.userId)!, 'public-key') };
     }
-    const u = authorized(c);
+    const u = authorized(c, ['mfa.status', 'mfa.setup', 'mfa.enable', 'mfa.cancel', 'auth.logout'].includes(op));
+    if (op.startsWith('mfa.')) {
+      need(u.role === 'admin', 'FORBIDDEN');
+      if (op === 'mfa.status') return { meta: { ...mfa.status(u.id), recoveryOnly: mfa.factor(c.session!, u.id, u.authVersion) === 'recovery' } };
+      if (op === 'mfa.cancel') { c.mfaSetup?.secret.fill(0); c.mfaSetup = undefined; return {}; }
+      if (op === 'mfa.setup') {
+        await mfaPassword(c, u, m.password);
+        need(!mfa.enabled(u.id) || mfa.factor(c.session!, u.id, u.authVersion) === 'recovery', 'MFA_ALREADY_ENABLED');
+        audit(c, op, 'allowed'); c.mfaSetup?.secret.fill(0);
+        c.mfaSetup = { secret: randomBytes(20), expires: mfa.now() + 300000, authVersion: u.authVersion };
+        return { meta: { secret: base32(c.mfaSetup.secret), issuer: 'SafeDrop', account: u.name, period: 30, digits: 6, expires: c.mfaSetup.expires } };
+      }
+      if (op === 'mfa.enable') {
+        const pending = c.mfaSetup; need(pending && pending.expires > mfa.now() && pending.authVersion === u.authVersion, 'MFA_SETUP_EXPIRED');
+        need(m.confirm === '启用双因素认证', 'INVALID_INPUT');
+        need(!mfa.enabled(u.id) || mfa.factor(c.session!, u.id, u.authVersion) === 'recovery', 'MFA_ALREADY_ENABLED');
+        const enroll = mfa.enroll(u.id, pending.secret, m.code);
+        const codes = store.transaction(() => { const codes = enroll(); upgradeFactor(c, u, true); audit(c, op, 'allowed', { sessions: 'others-revoked', keys: 'revoked' }); return codes; });
+        stopUser(u.id, 'MFA_CHANGED', c, true); return { meta: { enabled: true, recoveryCodes: codes } };
+      }
+      if (op === 'mfa.disable' || op === 'mfa.recovery') {
+        need(mfa.enabled(u.id), 'MFA_NOT_ENABLED'); await mfaPassword(c, u, m.password);
+        need(m.confirm === (op === 'mfa.disable' ? '停用双因素认证' : '更新恢复码'), 'INVALID_INPUT');
+        const proof = mfa.proof(u.id, m.code); let codes: string[] | undefined;
+        store.transaction(() => {
+          proof.consume();
+          if (op === 'mfa.disable') { store.run('DELETE FROM mfa_settings WHERE userId=?', u.id); store.run('DELETE FROM mfa_recovery WHERE userId=?', u.id); }
+          else codes = mfa.recoveryCodes(u.id);
+          upgradeFactor(c, u, op !== 'mfa.disable'); audit(c, op, 'allowed', { sessions: 'others-revoked', keys: 'revoked' });
+        });
+        stopUser(u.id, 'MFA_CHANGED', c, true); return { meta: { enabled: op !== 'mfa.disable', ...(codes ? { recoveryCodes: codes } : {}) } };
+      }
+      throw new Fault('UNKNOWN_OPERATION');
+    }
     if (op === 'maintenance.status') {
       admin(c); const backups = await backupList(backupRoot);
       return { meta: { storage: storage.usage(), audit: { bytes: store.auditBytes, limit: store.auditLimit, protected: store.auditBytes + 65536 > store.auditLimit }, staleDays: (config.storage?.staleMs ?? 7 * 86400000) / 86400000, expiredBatch: storage.expired().length, cleanupAutomatic: Boolean(config.storage?.cleanupIntervalMs), backups, backupCount: config.storage?.backupCount ?? 3, busy: maintenanceBusy } };
@@ -438,6 +519,7 @@ export function createApp(config: Config) {
     }
     if (op === 'keys.list') return { meta: { keys: store.all('SELECT id,label,created FROM keys WHERE userId=?', u.id) } };
     if (op === 'keys.enroll' || op === 'keys.revoke') {
+      if (op === 'keys.enroll') need(!mfa.enabled(u.id), 'MFA_PASSWORD_REQUIRED');
       need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED'); authenticating++;
       try { need(await passwordCheck(text(m.password, 256), u.hash), 'INVALID_CREDENTIALS'); } finally { authenticating--; }
       need(authorized(c).authVersion === u.authVersion, 'SESSION_EXPIRED');
@@ -467,7 +549,9 @@ export function createApp(config: Config) {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const c: Context = { ws, connection: id(), ip: req.socket.remoteAddress ?? 'unknown', agent: (req.headers['user-agent'] ?? 'unknown').slice(0, 160), abort: new AbortController(), pending: 0, alive: true, startedDownloads: new Set() };
     contexts.add(c); let queue = Promise.resolve();
-    const authDeadline = setTimeout(() => { if (!c.user) ws.close(4003, 'AUTH_TIMEOUT'); }, 30000);
+    let authDeadline = setTimeout(function deadline() {
+      if (!c.user) { if (c.mfaLogin && c.mfaLogin.expires > mfa.now()) authDeadline = setTimeout(deadline, c.mfaLogin.expires - mfa.now()); else ws.close(4003, 'AUTH_TIMEOUT'); }
+    }, 30000);
     ws.on('pong', () => { c.alive = true; });
     ws.on('message', (data, binary) => {
       const bytes = Buffer.isBuffer(data) ? data : Buffer.concat(Array.isArray(data) ? data : [Buffer.from(data)]);
@@ -495,12 +579,12 @@ export function createApp(config: Config) {
       const work = queue; operations.add(work); void work.then(() => operations.delete(work));
     });
     ws.on('error', () => { /* Peer protocol violations must not crash the server. */ });
-    ws.on('close', () => { clearTimeout(authDeadline); c.abort.abort(); contexts.delete(c); if (c.session) try { store.run('UPDATE sessions SET revoked=1 WHERE id=?', c.session); } catch { /* The connection is already invalid; a storage failure must not escape this event handler. */ } });
+    ws.on('close', () => { clearTimeout(authDeadline); c.abort.abort(); c.mfaLogin = undefined; c.mfaSetup?.secret.fill(0); c.mfaSetup = undefined; contexts.delete(c); if (c.session) try { store.run('UPDATE sessions SET revoked=1 WHERE id=?', c.session); } catch { /* The connection is already invalid; a storage failure must not escape this event handler. */ } });
   });
   const heartbeat = setInterval(() => {
     for (const c of contexts) {
       if (!c.alive) { c.ws.terminate(); continue; }
-      if (c.session) try { authorized(c); } catch { c.abort.abort(); c.ws.close(4001, 'SESSION_EXPIRED'); continue; }
+      if (c.session) try { authorized(c, true); } catch { c.abort.abort(); c.ws.close(4001, 'SESSION_EXPIRED'); continue; }
       c.alive = false; c.ws.ping();
     }
   }, 20000); heartbeat.unref();
