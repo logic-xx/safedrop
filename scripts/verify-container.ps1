@@ -47,18 +47,27 @@ try {
     $privateDir = Join-Path $projectRoot '.local/container-check'
     New-Item -ItemType Directory -Path $privateDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $projectRoot 'reports') -Force | Out-Null
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
     $snapshotSource = Get-Content -LiteralPath 'scripts/data-snapshot.mjs' -Raw -Encoding UTF8
     $existingSnapshot = $null
+    $previousAccountsHash = $null
+    $previousCAHash = $null
     $existingApp = (Invoke-DockerChecked @composeArgs ps --quiet app)
     if ($existingApp) {
         # Runs against the old image too: the source uses only built-in Node modules.
         # Capture only row fingerprints; no password hashes, names or tokens are printed.
         $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
         $existingSnapshot = (Invoke-DockerInput -InputText $snapshotSource -DockerArgs $snapshotArgs | ConvertFrom-Json)
+        Invoke-DockerChecked @composeArgs cp 'app:/data/accounts.json' (Join-Path $privateDir 'accounts-before-upgrade.json')
+        $previousAccountsHash = (Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts-before-upgrade.json') -Algorithm SHA256).Hash
+    }
+    $existingGateway = (Invoke-DockerChecked @composeArgs ps --quiet gateway)
+    if ($existingGateway) {
+        Invoke-DockerChecked @composeArgs cp 'gateway:/data/caddy/pki/authorities/local/root.crt' (Join-Path $privateDir 'ca-before-upgrade.crt')
+        $previousCAHash = (Get-FileHash -LiteralPath (Join-Path $privateDir 'ca-before-upgrade.crt') -Algorithm SHA256).Hash
     }
     Write-Host 'Building and starting isolated project safedrop-check on https://localhost:18443 ...'
     # Mounted Caddyfile changes require a new process even if its path is stable.
@@ -96,6 +105,17 @@ try {
     # Credentials remain in the ignored .local directory and are never printed.
     $accountsHash = (Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts.json') -Algorithm SHA256).Hash
     $caHash = (Get-FileHash -LiteralPath (Join-Path $privateDir 'ca.crt') -Algorithm SHA256).Hash
+    if ($previousAccountsHash) { Assert-Condition ($accountsHash -eq $previousAccountsHash) 'Generated credentials changed during image upgrade.' }
+    if ($previousCAHash) { Assert-Condition ($caHash -eq $previousCAHash) 'The gateway CA changed during image upgrade.' }
+    $upgradeIdentity = [ordered]@{ accountsChecked = [bool]$previousAccountsHash; caChecked = [bool]$previousCAHash; stableAccounts = ($null -eq $previousAccountsHash -or $accountsHash -eq $previousAccountsHash); stableCA = ($null -eq $previousCAHash -or $caHash -eq $previousCAHash) }
+    # Read the actual running binary, not just the Dockerfile or source lockfile.
+    $gatewayBuildInfo = Invoke-DockerChecked @composeArgs exec --no-TTY gateway caddy build-info
+    $gatewayJson = $gatewayBuildInfo | & node 'scripts/gateway-policy.mjs'
+    if ($LASTEXITCODE -ne 0) { throw 'Running gateway dependency verification failed.' }
+    $gatewayResult = $gatewayJson | ConvertFrom-Json
+    Assert-Condition ([bool]$gatewayResult.ok) 'The running gateway does not contain the pinned security fixes.'
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-gateway.json'), ($gatewayResult | ConvertTo-Json -Depth 5), $utf8)
+    Write-Host 'PASS running gateway Go/dependency versions; legacy go-jose is absent.'
     $appId = (Invoke-DockerChecked @composeArgs ps --quiet app).Trim()
     $gatewayId = (Invoke-DockerChecked @composeArgs ps --quiet gateway).Trim()
     $appInfo = @(Invoke-DockerChecked inspect $appId | ConvertFrom-Json)[0]
@@ -157,7 +177,7 @@ try {
     Invoke-DockerChecked @composeArgs cp 'gateway:/data/caddy/pki/authorities/local/root.crt' (Join-Path $privateDir 'ca-after.crt')
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'accounts-after.json') -Algorithm SHA256).Hash -eq $accountsHash) 'Generated credentials changed after restart.'
     Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $privateDir 'ca-after.crt') -Algorithm SHA256).Hash -eq $caHash) 'The gateway CA changed after restart.'
-    $summary = [ordered]@{ version = 7; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true }; mfa = $mfaResult }
+    $summary = [ordered]@{ version = 8; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true }; mfa = $mfaResult }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

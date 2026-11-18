@@ -114,12 +114,23 @@ jobs:
       - name: Record sanitized runtime results
         if: always() && steps.runtime.outcome == 'success'
         run: npm run ci:runtime-report
+      - name: Verify old CA compatibility with the actual gateway binaries
+        if: always() && steps.runtime.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p tmp
+          baseline=$(docker create caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0)
+          trap 'docker rm -v "$baseline" >/dev/null' EXIT
+          docker cp "$baseline:/usr/bin/caddy" tmp/gateway-baseline
+          docker compose -p safedrop-check -f compose.yaml -f deploy/compose.verify.yaml cp gateway:/usr/bin/caddy tmp/gateway-candidate
+          chmod +x tmp/gateway-baseline tmp/gateway-candidate
+          GATEWAY_BASELINE_BINARY="$PWD/tmp/gateway-baseline" GATEWAY_BINARY="$PWD/tmp/gateway-candidate" node --test tests/gateway-smoke.test.mjs
       - name: Scan the actual built application image
         if: always() && steps.runtime.outcome == 'success'
         run: npm run ci:image -- safedrop:verify
       - name: Scan the gateway image
-        if: always()
-        run: npm run ci:image -- caddy:2.11.9-alpine remote
+        if: always() && steps.runtime.outcome == 'success'
+        run: npm run ci:image -- safedrop-gateway:verify
       - name: Check report credentials before upload
         id: artifacts
         if: always()

@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { resolve, join, dirname, sep } from 'node:path';
 import { tool } from './tool.mjs';
 import { auditPolicy, safeSourcePath, imagePolicy, secureNode24 } from './policy.mjs';
+import { gatewayPolicy } from '../gateway-policy.mjs';
 const [mode, reference, imageSource = 'docker'] = process.argv.slice(2);
 const git = args => execFileSync('git', args, { encoding: 'utf8', windowsHide: true });
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
@@ -65,8 +66,10 @@ try {
     }
   } else if (mode === 'runtime-report') {
     const report = await json('reports/container-latest.json');
-    if(report.ok !== true || report.version !== 7 || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
-    await save('runtime-report',{ok:true,scope:'isolated CI containers; no user data volumes',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,profileChecks:report.profile.checks.length});
+    if(report.ok !== true || report.version !== 8 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
+    gatewayPolicy('go\t'+report.gateway.go+'\n'+Object.entries(report.gateway.modules??{}).map(([name,version])=>'dep\t'+name+'\t'+version).join('\n'));
+    if(report.gateway.oldGoJosePresent!==false) throw Error('GATEWAY_LEGACY_DEPENDENCY_PRESENT');
+    await save('runtime-report',{ok:true,scope:'isolated CI containers; no user data volumes',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
     console.log('Isolated runtime, strict HTTPS/WSS, persistent data and backup checks: passed');
   } else if (mode === 'artifacts') {
     const executable = await tool('gitleaks'), snapshot = await mkdtemp(resolve('.local/ci-artifact-'));
