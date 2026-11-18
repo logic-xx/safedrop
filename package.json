@@ -11,10 +11,16 @@
     "dev": "tsx watch server/index.ts",
     "start": "tsx server/index.ts",
     "build": "vue-tsc --noEmit && tsc -p tsconfig.server.json && tsc -p tsconfig.runtime.json && vite build",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test tests/*.test.ts tests/*.test.mjs",
     "security:report": "tsx scripts/security-report.ts",
     "audit:verify": "tsx scripts/verify-audit.ts",
-    "maintenance": "tsx scripts/maintenance.ts"
+    "maintenance": "tsx scripts/maintenance.ts",
+    "ci:audit": "node scripts/ci/check.mjs audit",
+    "ci:secrets": "node scripts/ci/check.mjs secrets",
+    "ci:scanner-test": "node scripts/ci/check.mjs scanner-test",
+    "ci:artifacts": "node scripts/ci/check.mjs artifacts",
+    "ci:workflow": "node scripts/ci/check.mjs workflow",
+    "ci:image": "node scripts/ci/check.mjs image"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",

@@ -1,0 +1,126 @@
+name: SafeDrop security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.14.0'
+          package-manager-cache: false
+      - run: npm ci --cache .npm-cache
+      - name: Locate OpenSSL on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $opensslPath = Join-Path $env:ProgramFiles 'Git\usr\bin\openssl.exe'
+          if (-not (Test-Path -LiteralPath $opensslPath)) { throw 'Git OpenSSL executable missing' }
+          "OPENSSL_PATH=$opensslPath" >> $env:GITHUB_ENV
+      - run: npm run build
+      - run: npm test
+      - name: TLS/WSS security scenarios
+        if: runner.os == 'Linux'
+        run: npm run security:report
+      - name: Check report credentials before upload
+        id: artifacts
+        if: always() && runner.os == 'Linux'
+        run: npm run ci:artifacts
+      - name: Publish security scenario results
+        if: always() && runner.os == 'Linux' && steps.artifacts.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scenarios-${{ github.sha }}
+          path: |
+            reports/latest.json
+            reports/latest.html
+          if-no-files-found: warn
+          retention-days: 14
+
+  source-security:
+    name: Workflow, dependency and credential checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.14.0'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --cache .npm-cache
+      - run: npm run ci:workflow
+      - if: always()
+        run: npm run ci:audit
+      - if: always()
+        run: npm run ci:secrets
+      - if: always()
+        run: npm run ci:scanner-test
+      - name: Check report credentials before upload
+        id: artifacts
+        if: always()
+        run: npm run ci:artifacts
+      - name: Publish sanitized source checks
+        if: always() && steps.artifacts.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: source-security-${{ github.sha }}
+          path: reports/ci/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  image-security:
+    name: Built application and gateway image vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.14.0'
+          package-manager-cache: false
+      - run: docker build --tag safedrop:ci .
+      - name: Scan the actual built application image
+        run: npm run ci:image -- safedrop:ci
+      - name: Scan the gateway image
+        if: always()
+        run: npm run ci:image -- caddy:2.11.9-alpine remote
+      - name: Check report credentials before upload
+        id: artifacts
+        if: always()
+        run: npm run ci:artifacts
+      - name: Publish image results
+        if: always() && steps.artifacts.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-security-${{ github.sha }}
+          path: reports/ci/*.json
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,12 @@
+[
+  {
+    "ecosystem": "npm",
+    "package": "picomatch",
+    "versions": ["4.0.7"],
+    "advisory": "https://github.com/advisories/GHSA-fc5q-39xc-vjpf",
+    "severity": "high",
+    "devOnly": true,
+    "expires": "2026-11-25T00:00:00+08:00",
+    "reason": "2026-11-18: upstream reports no patched release. Only the fixed development build dependency is accepted temporarily; SafeDrop does not expose user-controlled glob patterns or use picomatch in its production runtime. Production audit is checked separately without exceptions. Recheck before expiry; this is not a fix."
+  }
+]
