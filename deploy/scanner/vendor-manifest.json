@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "product": "ClamAV",
+  "version": "1.5.5",
+  "packageVersion": "1.5.5-1",
+  "platform": "linux/x64",
+  "archive": {
+    "url": "https://github.com/Cisco-Talos/clamav/releases/download/clamav-1.5.5/clamav-1.5.5.linux.x86_64.deb",
+    "sha256": "fff17fb1f8917d1ea1308c9736dabe376077458aba000a5dadcce7193a8c538c"
+  },
+  "files": [
+    {
+      "path": "/usr/local/bin/freshclam",
+      "sha256": "be46ede1b48850ab135366a5b3323182c838de7f9f2eee61d5c9ffefe51e915f"
+    },
+    {
+      "path": "/usr/local/etc/certs/clamav.crt",
+      "sha256": "60200e4b4b1b1b7257bb4550487aeb142034341f3300a8526e77a3134a940e9d"
+    },
+    {
+      "path": "/usr/local/lib/libclamav.so.12.1.0",
+      "sha256": "d8bba01808d16d274f8e35bca3befa05b40c8b40b8181381a10f330a847d81f5"
+    },
+    {
+      "path": "/usr/local/lib/libclammspack.so.0.8.0",
+      "sha256": "215371cfd585f8a8ce166352b3b64d6f212a675c66229a152688c552becb9f91"
+    },
+    {
+      "path": "/usr/local/lib/libclamunrar.so.12.1.0",
+      "sha256": "70e373601ff8ab467a032285876d37e79ca29064a38390b737c230a3b88acb3d"
+    },
+    {
+      "path": "/usr/local/lib/libclamunrar_iface.so.12.1.0",
+      "sha256": "6fbd76ee865b9d5ffc34393d329f762f61c2f8e89db355e2bb4b1d68c69baf74"
+    },
+    {
+      "path": "/usr/local/lib/libfreshclam.so.4.0.0",
+      "sha256": "cdf3b6c15870b2f48f0229e5e0aa9faf802a1cf30f5685f20668f4f9d6f44d04"
+    },
+    {
+      "path": "/usr/local/sbin/clamd",
+      "sha256": "bf5d92ed5a9df3e26518ecf27e0cb436efed2cc0cda0af17b41305932b04cdcf"
+    }
+  ],
+  "symlinks": [
+    {
+      "path": "/usr/local/lib/libclamav.so",
+      "target": "libclamav.so.12"
+    },
+    {
+      "path": "/usr/local/lib/libclamav.so.12",
+      "target": "libclamav.so.12.1.0"
+    },
+    {
+      "path": "/usr/local/lib/libclammspack.so",
+      "target": "libclammspack.so.0"
+    },
+    {
+      "path": "/usr/local/lib/libclammspack.so.0",
+      "target": "libclammspack.so.0.8.0"
+    },
+    {
+      "path": "/usr/local/lib/libclamunrar.so",
+      "target": "libclamunrar.so.12"
+    },
+    {
+      "path": "/usr/local/lib/libclamunrar.so.12",
+      "target": "libclamunrar.so.12.1.0"
+    },
+    {
+      "path": "/usr/local/lib/libclamunrar_iface.so",
+      "target": "libclamunrar_iface.so.12"
+    },
+    {
+      "path": "/usr/local/lib/libclamunrar_iface.so.12",
+      "target": "libclamunrar_iface.so.12.1.0"
+    },
+    {
+      "path": "/usr/local/lib/libfreshclam.so",
+      "target": "libfreshclam.so.4"
+    },
+    {
+      "path": "/usr/local/lib/libfreshclam.so.4",
+      "target": "libfreshclam.so.4.0.0"
+    }
+  ]
+}

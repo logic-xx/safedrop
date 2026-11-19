@@ -5,6 +5,7 @@ import { resolve, join, dirname, sep } from 'node:path';
 import { tool } from './tool.mjs';
 import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy } from './policy.mjs';
 import { gatewayPolicy } from '../gateway-policy.mjs';
+import { scannerAssessment } from './scanner-assessment.mjs';
 const [mode, reference, imageSource = 'docker'] = process.argv.slice(2);
 const git = args => execFileSync('git', args, { encoding: 'utf8', windowsHide: true });
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
@@ -67,10 +68,10 @@ try {
   } else if (mode === 'runtime-report') {
     const report = await json('reports/container-latest.json');
     const scanning = scanRuntimePolicy(report);
-    if(report.ok !== true || report.version !== 10 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.backup?.encrypted !== true || report.backupEncryption?.ok !== true || report.backupEncryption?.stableKeyRing !== true || report.backupEncryption?.rotation !== true || report.backupEncryption?.keyReload !== true || report.backupEncryption?.legacyCompatibility !== true || report.backupEncryption?.authenticationFailuresRejected !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
+    if(report.ok !== true || report.version !== 10 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.backup?.encrypted !== true || report.backupEncryption?.ok !== true || report.backupEncryption?.stableKeyRing !== true || report.backupEncryption?.rotation !== true || report.backupEncryption?.keyReload !== true || report.backupEncryption?.legacyCompatibility !== true || report.backupEncryption?.authenticationFailuresRejected !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || report.scannerProvenance?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
     gatewayPolicy('go\t'+report.gateway.go+'\n'+Object.entries(report.gateway.modules??{}).map(([name,version])=>'dep\t'+name+'\t'+version).join('\n'));
     if(report.gateway.oldGoJosePresent!==false) throw Error('GATEWAY_LEGACY_DEPENDENCY_PRESENT');
-    await save('runtime-report',{ok:true,scope:process.env.GITHUB_ACTIONS === 'true' ? 'isolated CI containers; no user data volumes' : 'local containers; see original report for retained data scope',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,backupEncryption:report.backupEncryption,scanning,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
+    await save('runtime-report',{ok:true,scope:process.env.GITHUB_ACTIONS === 'true' ? 'isolated CI containers; no user data volumes' : 'local containers; see original report for retained data scope',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,backupEncryption:report.backupEncryption,scanning,scannerProvenance:report.scannerProvenance,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
     console.log('Isolated runtime, strict HTTPS/WSS, persistent data and backup checks: passed');
   } else if (mode === 'artifacts') {
     const executable = await tool('gitleaks'), snapshot = await mkdtemp(resolve('.local/ci-artifact-'));
@@ -95,7 +96,7 @@ try {
     }
   } else if (mode === 'scanner-test') {
     const executable = await tool('gitleaks');
-    const result = run(process.execPath, ['--test','tests/ci-policy.test.mjs'], 60000, { ...process.env, CI_GITLEAKS: executable });
+    const result = run(process.execPath, ['--test','tests/ci-policy.test.mjs','tests/scanner-assessment.test.mjs'], 60000, { ...process.env, CI_GITLEAKS: executable });
     const ok = !result.error && result.status === 0; await save('scanner-test', { ok, scope: 'policy negatives and real synthetic-token detection/redaction' });
     if (!ok) throw Error('CI_SCANNER_SELF_TEST_FAILED'); console.log('Policy and real scanner self-test: passed');
   } else if (mode === 'workflow') {
@@ -113,15 +114,20 @@ try {
     await mkdir(registry,{recursive:true}); await mkdir(temporary,{recursive:true}); await writeFile(join(registry,'config.json'),'{"auths":{}}');
     // Go's file URL handling cannot round-trip the sandbox's # in its default
     // temporary path on Windows. Keep only this child process's files here.
-    const result = run(executable, ['image','--image-src',imageSource,'--scanners','vuln','--no-progress','--format','json','--output',path,'--cache-dir',resolve('.local/trivy-cache'),'--timeout','10m',reference],660000,{...process.env,DOCKER_CONFIG:registry,TEMP:temporary,TMP:temporary,TMPDIR:temporary});
+    const result = run(executable, ['image','--image-src',imageSource,'--scanners','vuln','--list-all-pkgs','--no-progress','--format','json','--output',path,'--cache-dir',resolve('.local/trivy-cache'),'--timeout','10m',reference],660000,{...process.env,DOCKER_CONFIG:registry,TEMP:temporary,TMP:temporary,TMPDIR:temporary});
     if (result.error || result.status !== 0) {
       await writeFile(join(privateRoot,'trivy-error.txt'), result.stderr ?? String(result.error));
       throw Error('TRIVY_SCAN_FAILED:SEE_PRIVATE_LOCAL_DIAGNOSTICS');
     }
-    const raw = await json(path), policy = imagePolicy(raw);
+    const raw = await json(path);let policy = imagePolicy(raw);
+    if(reference==='safedrop-scanner:verify'){
+      if(imageSource!=='docker')throw Error('ACTUAL_SCANNER_IMAGE_REQUIRED');
+      const runtime=await json('reports/container-latest.json');scanRuntimePolicy(runtime);
+      policy=scannerAssessment(raw,policy,runtime.scannerProvenance,await json('deploy/scanner/vendor-manifest.json'),await json('deploy/scanner/vendor-fixed.openvex.json'));
+    }
     const database = await json(resolve('.local/trivy-cache/db/metadata.json')).catch(()=>null);
     await save(resultName, { ...policy, reference, imageSource, scope: imageSource === 'docker' ? 'local built image' : 'remote registry image; not the final application image', database, version: (await json(new URL('./tools.json',import.meta.url))).trivy.version });
-    console.log(`Image scan: ${policy.status}; high/critical ${policy.blocked}; report reports/ci/${resultName}.json`); if (!policy.ok) process.exitCode = 1;
+    console.log(`Image scan: ${policy.status}; raw high/critical ${policy.rawBlocked??policy.blocked}; vendor-fixed ${policy.fixedByVendor?.length??0}; blocking ${policy.blocked}; report reports/ci/${resultName}.json`); if (!policy.ok) process.exitCode = 1;
   } else throw Error('Usage: check.mjs <audit|secrets|scanner-test|workflow|image|artifacts|runtime-report> [image-reference] [docker|remote]');
 } catch (e) {
   const error = e instanceof Error ? e.message : 'CI_CHECK_FAILED';

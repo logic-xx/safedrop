@@ -32,7 +32,7 @@ export function imagePolicy(report) {
     return (r.Vulnerabilities ?? []).map(v => {
       for(const key of ['VulnerabilityID','PkgName','InstalledVersion','Severity']) assert.equal(typeof v[key],'string','INVALID_IMAGE_FINDING');
       assert.ok(['UNKNOWN','LOW','MEDIUM','HIGH','CRITICAL'].includes(v.Severity),'INVALID_IMAGE_SEVERITY');
-      return { target: r.Target, id: v.VulnerabilityID, package: v.PkgName, installed: v.InstalledVersion, fixed: v.FixedVersion ?? null, severity: v.Severity, url: v.PrimaryURL };
+      return { target: r.Target, class:r.Class??null, type:r.Type??null, dataSource:v.DataSource?.ID??null, id: v.VulnerabilityID, package: v.PkgName, installed: v.InstalledVersion, fixed: v.FixedVersion ?? null, severity: v.Severity, url: v.PrimaryURL };
     });
   });
   const blocked = findings.filter(v => high(v.severity));

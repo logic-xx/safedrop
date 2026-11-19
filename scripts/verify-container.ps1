@@ -55,7 +55,7 @@ try {
     $privateDir = Join-Path $projectRoot '.local/container-check'
     New-Item -ItemType Directory -Path $privateDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $projectRoot 'reports') -Force | Out-Null
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-scanner-provenance.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
@@ -130,6 +130,14 @@ try {
     $appInfo = @(Invoke-DockerChecked inspect $appId | ConvertFrom-Json)[0]
     $gatewayInfo = @(Invoke-DockerChecked inspect $gatewayId | ConvertFrom-Json)[0]
     $scannerInfo = @(Invoke-DockerChecked inspect $scannerId | ConvertFrom-Json)[0]
+    # Bind the upstream fix assessment to every actual vendor binary/library and this image.
+    $scannerProofSource = Get-Content -LiteralPath 'scripts/scanner-provenance.mjs' -Raw -Encoding UTF8
+    $scannerProofArgs = $composeArgs + @('exec', '--no-TTY', 'scanner', '/nodejs/bin/node', '--input-type=module')
+    $scannerProvenance = Invoke-DockerInput -InputText $scannerProofSource -DockerArgs $scannerProofArgs | ConvertFrom-Json
+    Assert-Condition ([bool]$scannerProvenance.ok) 'Running scanner binaries differ from the pinned official vendor package.'
+    $scannerProvenance | Add-Member -NotePropertyName imageId -NotePropertyValue $scannerInfo.Image
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-scanner-provenance.json'), ($scannerProvenance | ConvertTo-Json -Depth 6), $utf8)
+    Write-Host 'PASS exact official scanner binaries, libraries and links; provenance bound to running image ID.'
     # Save only non-secret configuration so a failed check can be diagnosed.
     $runtimeEvidence = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); appUser = $appInfo.Config.User; appNetworks = @($appInfo.NetworkSettings.Networks.PSObject.Properties.Name); gatewayNetworks = @($gatewayInfo.NetworkSettings.Networks.PSObject.Properties.Name); gatewayRequestedPorts = $gatewayInfo.HostConfig.PortBindings; gatewayPublishedPorts = $gatewayInfo.NetworkSettings.Ports }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-runtime.json'), ($runtimeEvidence | ConvertTo-Json -Depth 6), $utf8)
@@ -224,7 +232,7 @@ try {
     Assert-Condition ((Get-FileHash -LiteralPath $hostBackupKeyAfter -Algorithm SHA256).Hash -eq $backupKeyHash) 'The independent backup key file changed after restart.'
     $backupResult | Add-Member -NotePropertyName stableKeyRing -NotePropertyValue $true
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-backup.json'), ($backupResult | ConvertTo-Json -Depth 5), $utf8)
-    $summary = [ordered]@{ version = 10; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult }
+    $summary = [ordered]@{ version = 10; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

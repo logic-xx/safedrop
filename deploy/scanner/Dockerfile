@@ -23,6 +23,7 @@ COPY deploy/scanner/LICENSES.txt /usr/share/doc/clamav/LICENSES.txt
 COPY --from=vendor --chown=65532:65532 /runtime-data /data
 COPY --from=signatures --chown=65532:65532 /var/lib/clamav /seed
 COPY deploy/scanner/clamd.conf deploy/scanner/freshclam.conf deploy/scanner/run.mjs deploy/scanner/health.mjs ./
+COPY deploy/scanner/vendor-manifest.json ./
 USER 65532:65532
 EXPOSE 3310
 CMD ["/scanner/run.mjs"]

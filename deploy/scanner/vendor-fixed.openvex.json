@@ -1,0 +1,149 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/logic-xx/safedrop/blob/main/deploy/scanner/vendor-fixed.openvex.json",
+  "author": "SafeDrop CI assessment",
+  "timestamp": "2026-11-19T05:19:54.159Z",
+  "version": 1,
+  "tooling": "Keeps raw Trivy findings; applies only with actual image ID and exact official binary/library hashes.",
+  "vendorBinding": {
+    "version": "1.5.5",
+    "packageVersion": "1.5.5-1",
+    "archiveSha256": "fff17fb1f8917d1ea1308c9736dabe376077458aba000a5dadcce7193a8c538c",
+    "manifestSha256": "95f27d519e91e69dfb3f6ef6ea255221241d052c0b2243d9f84cf5e23c49af55"
+  },
+  "statements": [
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20213",
+        "name": "CVE-2026-20213"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20213"
+      ]
+    },
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20214",
+        "name": "CVE-2026-20214"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20214"
+      ]
+    },
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20215",
+        "name": "CVE-2026-20215"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20215"
+      ]
+    },
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20216",
+        "name": "CVE-2026-20216"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20216"
+      ]
+    },
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20217",
+        "name": "CVE-2026-20217"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20217"
+      ]
+    },
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20243",
+        "name": "CVE-2026-20243"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20243"
+      ]
+    },
+    {
+      "vulnerability": {
+        "@id": "https://nvd.nist.gov/vuln/detail/CVE-2026-20244",
+        "name": "CVE-2026-20244"
+      },
+      "products": [
+        {
+          "@id": "pkg:generic/clamav@1.5.5"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Official ClamAV 1.5.3 release confirms this CVE was fixed in 1.5.3; pinned vendor 1.5.5 includes that fix. Debian 13 no-fixed-version matching is not an upstream affected-version verdict.",
+      "upstreamFixedVersion": "1.5.3",
+      "references": [
+        "https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.3",
+        "https://github.com/Cisco-Talos/clamav/blob/clamav-1.5.5/NEWS.md",
+        "https://security-tracker.debian.org/tracker/CVE-2026-20244"
+      ]
+    }
+  ]
+}
