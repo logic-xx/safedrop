@@ -16,7 +16,7 @@ import { MfaGuard, base32, type MfaProof } from './mfa.ts';
 import { ScanGuard } from './scans.ts';
 import type { ScanEngine } from './clamd.ts';
 
-export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string; scanner?: ScanEngine; scanMaxAgeMs?: number; scanClock?: () => number }
+export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string; scanner?: ScanEngine; scanMaxAgeMs?: number; scanClock?: () => number; deliveryClock?: () => number }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
@@ -41,6 +41,9 @@ export function createApp(config: Config) {
   need(verifyAudit(store.all('SELECT * FROM audit ORDER BY seq')).ok, 'AUDIT_INTEGRITY_FAILURE');
   store.run('UPDATE sessions SET revoked=1 WHERE revoked=0');
   const rate = new RateGate(), bw = new Bandwidth(config.normalRate, config.vipRate);
+  const deliveryNow = config.deliveryClock ?? Date.now;
+  const deliveryExpired = (d: Row) => d.reason === 'expired' || !d.revoked && d.expires > 0 && d.expires <= deliveryNow();
+  const deliveryFields = (d: Row) => ({ ...d, expired: Boolean(deliveryExpired(d)) });
   const contexts = new Set<Context>(), locks = new Set<string>();
   const operations = new Set<Promise<void>>();
   const activeDispatches = new Set<Promise<unknown>>();
@@ -148,19 +151,29 @@ export function createApp(config: Config) {
     if (deliveryId === undefined) return { file: available(c, 'files', fid) };
     const delivery = store.get('SELECT d.*,o.name AS sender,r.name AS recipient,o.disabled AS ownerDisabled FROM deliveries d JOIN users o ON o.id=d.ownerId JOIN users r ON r.id=d.recipientId WHERE d.id=? AND d.fileId=? AND d.recipientId=?', text(deliveryId, 80), fid, u.id);
     need(delivery, 'NOT_FOUND');
+    need(delivery.reason !== 'expired', 'DELIVERY_EXPIRED');
     const file = store.get('SELECT * FROM files WHERE id=? AND userId=?', fid, delivery.ownerId);
     need(!delivery.revoked && !delivery.ownerDisabled && file && !store.get("SELECT id FROM deletions WHERE id=? AND kind='files'", fid), 'DELIVERY_UNAVAILABLE');
+    need(!deliveryExpired(delivery), 'DELIVERY_EXPIRED');
     return { file, delivery };
   }
   function readable(c: Context, fileId: unknown, deliveryId?: unknown) {
     const access = accessible(c, fileId, deliveryId); scans.requireClean(access.file); return access;
   }
   function deliveryAudit(c: Context, action: string, d: Row, extra: Row = {}) {
-    audit(c, action, 'allowed', { deliveryId: d.id, fileId: d.fileId, ownerId: d.ownerId, recipientId: d.recipientId, sender: d.sender, recipient: d.recipient, ...extra });
+    audit(c, action, 'allowed', { deliveryId: d.id, fileId: d.fileId, ownerId: d.ownerId, recipientId: d.recipientId, sender: d.sender, recipient: d.recipient, expires: d.expires, ...extra });
+  }
+  function markDeliveryExpired(d: Row) {
+    store.run("UPDATE deliveries SET revoked=1,revokedAt=expires,reason='expired' WHERE id=? AND revoked=0", d.id);
+    store.audit('system', 'deliveries.expire', 'allowed', { deliveryId: d.id, fileId: d.fileId, ownerId: d.ownerId, recipientId: d.recipientId, sender: d.sender, recipient: d.recipient, expires: d.expires });
+    void stopDownloads(job => job.deliveryId === d.id, new Fault('DELIVERY_EXPIRED'));
   }
   function endDeliveries(c: Context, where: string, args: string[], reason: string) {
     const rows = store.all(`SELECT d.*,o.name AS sender,r.name AS recipient FROM deliveries d JOIN users o ON o.id=d.ownerId JOIN users r ON r.id=d.recipientId WHERE d.revoked=0 AND (${where})`, ...args);
-    for (const d of rows) { store.run('UPDATE deliveries SET revoked=1,revokedAt=?,reason=? WHERE id=?', Date.now(), reason, d.id); deliveryAudit(c, 'deliveries.revoke', d, { reason }); }
+    for (const d of rows) {
+      if (deliveryExpired(d)) { markDeliveryExpired(d); continue; }
+      store.run('UPDATE deliveries SET revoked=1,revokedAt=?,reason=? WHERE id=?', Date.now(), reason, d.id); deliveryAudit(c, 'deliveries.revoke', d, { reason });
+    }
   }
   function stopDownloads(predicate: (job: DownloadJob) => boolean, reason?: Fault) {
     const jobs = [...downloads.values()].flatMap(set => [...set]).filter(predicate);
@@ -181,9 +194,17 @@ export function createApp(config: Config) {
     const abort = new AbortController(); let settled!: () => void;
     const job: DownloadJob = { abort, done: new Promise<void>(r => { settled = r; }), userId: c.user!.id, ownerId: access.file.userId, deliveryId: access.delivery?.id };
     let jobs = downloads.get(fileId); if (!jobs) downloads.set(fileId, jobs = new Set()); jobs.add(job);
+    let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+    const checkExpiry = () => {
+      if (!access.delivery?.expires) return;
+      const remaining = access.delivery.expires - deliveryNow();
+      if (remaining <= 0) abort.abort(new Fault('DELIVERY_EXPIRED'));
+      else { expiryTimer = setTimeout(checkExpiry, Math.min(remaining, 2147483647)); expiryTimer.unref(); }
+    };
+    checkExpiry();
     try { return await fn(AbortSignal.any([c.abort.signal, abort.signal])); }
     catch (e) { if (abort.signal.aborted) throw abort.signal.reason instanceof Fault ? abort.signal.reason : new Fault(job.deliveryId ? 'DELIVERY_UNAVAILABLE' : 'FILE_DELETING'); throw e; }
-    finally { jobs.delete(job); if (!jobs.size) downloads.delete(fileId); settled(); }
+    finally { clearTimeout(expiryTimer); jobs.delete(job); if (!jobs.size) downloads.delete(fileId); settled(); }
   }
   async function erase(c: Context, table: 'transfers' | 'files', targetId: unknown, expired?: Row) {
     const row = expired ?? owned(c, table, targetId), op = expired ? 'maintenance.expire' : table === 'files' ? 'files.delete' : 'upload.cancel';
@@ -425,19 +446,23 @@ export function createApp(config: Config) {
       const name = text(m.recipient, 32);
       const recipient = /^[a-zA-Z0-9_-]{3,32}$/.test(name) ? store.get('SELECT id,name FROM users WHERE name=? AND disabled=0 AND id<>?', name, u.id) : undefined;
       need(recipient, 'RECIPIENT_UNAVAILABLE');
-      if (op === 'deliveries.prepare') return { meta: { recipient: { name: recipient.name }, file: { id: file.id, name: file.name, size: file.size } } };
+      const hours = m.hours === undefined ? 168 : m.hours;
+      need(typeof hours === 'number' && Number.isSafeInteger(hours) && hours >= 1 && hours <= 720, 'INVALID_DELIVERY_EXPIRY');
+      if (op === 'deliveries.prepare') return { meta: { recipient: { name: recipient.name }, file: { id: file.id, name: file.name, size: file.size }, hours } };
       need(rate.allow('delivery-create:' + u.id, 30), 'RATE_LIMITED');
       return store.transaction(() => {
-        const existing = store.get('SELECT id FROM deliveries WHERE fileId=? AND recipientId=? AND revoked=0', file.id, recipient.id);
-        if (existing) return { meta: { deliveryId: existing.id, created: false } };
-        need(store.get('SELECT COUNT(*) AS n FROM deliveries WHERE ownerId=? AND revoked=0', u.id)!.n < 1000 && store.get('SELECT COUNT(*) AS n FROM deliveries WHERE recipientId=? AND revoked=0', recipient.id)!.n < 1000 && store.get('SELECT COUNT(*) AS n FROM deliveries WHERE fileId=? AND revoked=0', file.id)!.n < 32, 'DELIVERY_LIMIT');
-        const d = { id: id(), fileId: file.id, ownerId: u.id, recipientId: recipient.id, sender: u.name, recipient: recipient.name };
-        store.run('INSERT INTO deliveries(id,fileId,ownerId,recipientId,name,created) VALUES(?,?,?,?,?,?)', d.id, file.id, u.id, recipient.id, file.name, Date.now());
-        deliveryAudit(c, op, d); return { meta: { deliveryId: d.id, created: true } };
+        const existing = store.get('SELECT d.*,o.name AS sender,r.name AS recipient FROM deliveries d JOIN users o ON o.id=d.ownerId JOIN users r ON r.id=d.recipientId WHERE d.fileId=? AND d.recipientId=? AND d.revoked=0', file.id, recipient.id);
+        if (existing && !deliveryExpired(existing)) return { meta: { deliveryId: existing.id, created: false, expires: existing.expires } };
+        if (existing) markDeliveryExpired(existing);
+        const now = deliveryNow();
+        need(store.get('SELECT COUNT(*) AS n FROM deliveries WHERE ownerId=? AND revoked=0 AND (expires=0 OR expires>?)', u.id, now)!.n < 1000 && store.get('SELECT COUNT(*) AS n FROM deliveries WHERE recipientId=? AND revoked=0 AND (expires=0 OR expires>?)', recipient.id, now)!.n < 1000 && store.get('SELECT COUNT(*) AS n FROM deliveries WHERE fileId=? AND revoked=0 AND (expires=0 OR expires>?)', file.id, now)!.n < 32, 'DELIVERY_LIMIT');
+        const d = { id: id(), fileId: file.id, ownerId: u.id, recipientId: recipient.id, sender: u.name, recipient: recipient.name, expires: now + hours * 3600000 };
+        store.run('INSERT INTO deliveries(id,fileId,ownerId,recipientId,name,created,expires) VALUES(?,?,?,?,?,?,?)', d.id, file.id, u.id, recipient.id, file.name, now, d.expires);
+        deliveryAudit(c, op, d); return { meta: { deliveryId: d.id, created: true, expires: d.expires } };
       });
     }
-    if (op === 'deliveries.received') return { meta: { deliveries: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id AS deliveryId,d.created AS sentAt,o.name AS sender FROM deliveries d JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId JOIN users o ON o.id=d.ownerId LEFT JOIN deletions x ON x.id=f.id AND x.kind='files' WHERE d.recipientId=? AND d.revoked=0 AND o.disabled=0 AND x.id IS NULL ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)).map(scanFields) } };
-    if (op === 'deliveries.sent') return { meta: { deliveries: store.all("SELECT d.id AS deliveryId,d.fileId,COALESCE(f.name,d.name) AS name,d.created AS sentAt,d.revoked,d.revokedAt,d.reason,r.name AS recipient FROM deliveries d JOIN users r ON r.id=d.recipientId LEFT JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId WHERE d.ownerId=? ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)) } };
+    if (op === 'deliveries.received') return { meta: { now: deliveryNow(), deliveries: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id AS deliveryId,d.created AS sentAt,d.expires,d.revoked,d.reason,o.name AS sender FROM deliveries d JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId JOIN users o ON o.id=d.ownerId LEFT JOIN deletions x ON x.id=f.id AND x.kind='files' WHERE d.recipientId=? AND (d.revoked=0 OR d.reason='expired') AND o.disabled=0 AND x.id IS NULL ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)).map(scanFields).map(deliveryFields) } };
+    if (op === 'deliveries.sent') return { meta: { now: deliveryNow(), deliveries: store.all("SELECT d.id AS deliveryId,d.fileId,COALESCE(f.name,d.name) AS name,d.created AS sentAt,d.expires,d.revoked,d.revokedAt,d.reason,r.name AS recipient FROM deliveries d JOIN users r ON r.id=d.recipientId LEFT JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId WHERE d.ownerId=? ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)).map(deliveryFields) } };
     if (op === 'deliveries.revoke') {
       const d = store.get('SELECT id FROM deliveries WHERE id=? AND ownerId=?', text(m.deliveryId, 80), u.id); need(d, 'NOT_FOUND');
       need(rate.allow('delivery-revoke:' + u.id, 60), 'RATE_LIMITED');
@@ -557,7 +582,7 @@ export function createApp(config: Config) {
       const keyId = id(); store.transaction(() => { store.run('INSERT INTO keys VALUES(?,?,?,?,?)', keyId, u.id, JSON.stringify(jwk), text(m.label, 60), Date.now()); audit(c, op, 'allowed', { keyId }); }); return { meta: { keyId } };
     }
     if (op === 'events.list') {
-      const events = store.all('SELECT seq,event FROM audit ORDER BY seq DESC LIMIT 300').map(r => ({ seq: r.seq, ...JSON.parse(r.event) })).filter(r => u.role === 'admin' || r.user === u.name || ['files.scan.begin', 'files.scan'].includes(r.action) && r.detail.ownerId === u.id || ['deliveries.create', 'deliveries.revoke', 'deliveries.download'].includes(r.action) && (r.detail.ownerId === u.id || r.detail.recipientId === u.id)).slice(0, 24);
+      const events = store.all('SELECT seq,event FROM audit ORDER BY seq DESC LIMIT 300').map(r => ({ seq: r.seq, ...JSON.parse(r.event) })).filter(r => u.role === 'admin' || r.user === u.name || ['files.scan.begin', 'files.scan'].includes(r.action) && r.detail.ownerId === u.id || ['deliveries.create', 'deliveries.revoke', 'deliveries.download', 'deliveries.expire'].includes(r.action) && (r.detail.ownerId === u.id || r.detail.recipientId === u.id)).slice(0, 24);
       while (Buffer.byteLength(JSON.stringify({ events })) > 12 * 1024) events.pop();
       return { meta: { events } };
     }
@@ -594,8 +619,9 @@ export function createApp(config: Config) {
           let result: { meta?: Row; payload?: Uint8Array };
           try { const work = dispatch(c, frame); activeDispatches.add(work); try { result = await work; } finally { activeDispatches.delete(work); } }
           finally { auditReserved -= reserve; }
+          const response = encode(2, frame.requestId, { ok: true, ...result.meta }, result.payload, frame.streamId);
           if (frame.meta.op === 'download.chunk' || frame.meta.op === 'download.init') readable(c, frame.meta.fileId, frame.meta.deliveryId);
-          if (ws.readyState === WebSocket.OPEN && !c.abort.signal.aborted) ws.send(encode(2, frame.requestId, { ok: true, ...result.meta }, result.payload, frame.streamId));
+          if (ws.readyState === WebSocket.OPEN && !c.abort.signal.aborted) ws.send(response);
         } catch (e) {
           const code = e instanceof Fault ? e.code : frame ? 'INTERNAL_ERROR' : 'INVALID_FRAME';
           if (!c.abort.signal.aborted && store.auditBytes + 4096 < store.auditLimit && rate.allow('audit-denied:' + c.ip, 30)) try { audit(c, typeof frame?.meta.op === 'string' ? frame.meta.op.slice(0, 64) : 'protocol.invalid', 'denied', { code }); } catch { /* A full or failed audit volume must not turn error handling into an uncaught exception. */ }
@@ -620,6 +646,15 @@ export function createApp(config: Config) {
       auditReserved += 65536; const work = cleanup().then(() => {}, () => {}).finally(() => { auditReserved -= 65536; }); operations.add(work); void work.finally(() => operations.delete(work));
     }
   }, config.storage.cleanupIntervalMs) : undefined; cleanupTimer?.unref();
+  const expiryTimer = setInterval(() => {
+    if (maintenanceBusy || store.auditBytes + auditReserved + 65536 > store.auditLimit) return;
+    auditReserved += 65536;
+    try {
+      const due = store.all('SELECT d.*,o.name AS sender,r.name AS recipient FROM deliveries d JOIN users o ON o.id=d.ownerId JOIN users r ON r.id=d.recipientId WHERE d.revoked=0 AND d.expires>0 AND d.expires<=? ORDER BY d.expires,d.id LIMIT 16', deliveryNow());
+      store.transaction(() => { for (const d of due) markDeliveryExpired(d); });
+    } catch { /* Expiry checks and download deadlines still deny access if audit storage fails. */ }
+    finally { auditReserved -= 65536; }
+  }, 1000); expiryTimer.unref();
   if (store.auditBytes + 4096 < store.auditLimit) store.audit('system', 'server.start', 'allowed', { protocol: 'SFT/1' });
-  return { server, store, bw, storage, scans, async close() { clearInterval(heartbeat); clearInterval(cleanupTimer); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await scans.close(); await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
+  return { server, store, bw, storage, scans, async close() { clearInterval(heartbeat); clearInterval(cleanupTimer); clearInterval(expiryTimer); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await scans.close(); await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
 }

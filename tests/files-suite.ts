@@ -191,7 +191,7 @@ export async function runFileSuite(onResult?: (r: Result) => void) {
     // Version 1 has exactly these unchanged tables and no deletion table.
     f.app.store.db.exec('DROP TABLE mfa_settings; DROP TABLE mfa_recovery; DROP TABLE mfa_sessions; DROP TABLE mfa_attempts; DROP TABLE transfer_activity; DROP TABLE deliveries; DROP TABLE deletions; PRAGMA user_version=1;');
     await f.restart(); const owner = await f.login(), admin = await f.login('admin');
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 6); assert.equal((await f.usage(owner)).used, bytes.length); assert.equal((await f.usage(owner)).reserved, bytes.length);
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal((await f.usage(owner)).used, bytes.length); assert.equal((await f.usage(owner)).reserved, bytes.length);
     assert.equal(digest((await owner.rpc('download.chunk', { fileId, offset: 0 })).payload), digest(bytes));
     assert.equal((await owner.rpc('upload.init', { transferId, name: '续传.bin', size: bytes.length, sha256: digest(bytes) })).meta.offset, 17);
     assert.equal(f.app.store.get('SELECT id FROM invitations WHERE id=?', invite.id)!.id, invite.id);

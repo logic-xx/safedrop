@@ -2,13 +2,16 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, renameSync, rmdirSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
+import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { WebSocket } from 'ws';
 import { createTestApp as createApp, scanFixtureFile } from './test-scanner.ts';
-import { digest, verifyAudit } from '../server/store.ts';
+import { digest, verifyAudit, Store } from '../server/store.ts';
+import { verifyBackup, restoreBackup } from '../server/backup.ts';
+import { changeBackupKeys } from '../server/backup-keys.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer, type Result } from './suite.ts';
 import { CHUNK, decode, type Metadata } from '../shared/protocol.ts';
@@ -18,7 +21,8 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
   const ca = readFileSync(join(root, 'tls/ca.crt')), tls = { cert: readFileSync(join(root, 'tls/server.crt')), key: readFileSync(join(root, 'tls/server.key')) }, pass = randomBytes(24).toString('base64url');
   const results: Result[] = [];
   async function fixture() {
-    const config = { root: mkdtempSync(join(root, 'data-')), origin: 'https://localhost', tls, loginLimit: 1000, normalRate: 64 * CHUNK, vipRate: 128 * CHUNK };
+    let now: number | undefined;
+    const config = { root: mkdtempSync(join(root, 'data-')), origin: 'https://localhost', tls, loginLimit: 1000, normalRate: 64 * CHUNK, vipRate: 128 * CHUNK, deliveryClock: () => now ?? Date.now() };
     let app = createApp(config); const ids: Record<string, string> = {};
     for (const name of ['owner', 'reader', 'stranger', 'second', 'admin']) ids[name] = await app.store.addUser(name, pass, name === 'admin' ? 'admin' : 'user');
     const start = async () => { app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening'); }; await start();
@@ -29,7 +33,7 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', fileId, ids.owner, '交付资料.bin', bytes.length, digest(bytes), Date.now());
     await scanFixtureFile(app, fileId);
     const send = async (recipient = 'reader', peer = owner) => String((await peer.rpc('deliveries.create', { fileId, recipient })).meta.deliveryId);
-    return { config, ids, bytes, fileId, owner, reader, stranger, admin, connect, login, send, get app() { return app; },
+    return { config, ids, bytes, fileId, owner, reader, stranger, admin, connect, login, send, get app() { return app; }, setNow(value?: number) { now = value; },
       async restart() { await app.close(); app = createApp(config); await start(); },
       async close() { assert.equal(verifyAudit(app.store.all('SELECT * FROM audit ORDER BY seq')).ok, true); assert.equal(JSON.stringify(app.store.all('SELECT * FROM audit')).includes(pass), false); await app.close(); }
     };
@@ -205,7 +209,134 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     const snapshot = () => JSON.parse(execFileSync(process.execPath, [resolve('scripts/data-snapshot.mjs')], { env: { ...process.env, DATA_DIR: f.config.root }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     const before = snapshot(); await f.restart(); const after = snapshot();
     for (const [table, records] of Object.entries(before.tables)) for (const [id, hash] of Object.entries(records as Record<string, string>)) assert.equal(after.tables[table][id], hash);
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 6); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
+  });
+  await run('授权期限：新授权默认七天，最短一小时及最长三十天均由服务端计算', async f => {
+    f.setNow(Date.now()); const now = f.config.deliveryClock();
+    for (const [recipient, hours] of [['reader', undefined], ['stranger', 1], ['second', 720]] as const) {
+      const m = (await f.owner.rpc('deliveries.create', { fileId: f.fileId, recipient, ...(hours === undefined ? {} : { hours }), expires: 0, created: 0 })).meta;
+      assert.equal(m.expires, now + (hours ?? 168) * 3600000);
+      assert.equal(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', m.deliveryId)!.expires, m.expires);
+    }
+    assert.equal((await f.owner.rpc('deliveries.prepare', { fileId: f.fileId, recipient: 'reader' })).meta.hours, 168);
+  });
+  await run('授权期限输入：零、负数、小数、字符串及超范围不能创建或延长授权', async f => {
+    for (const hours of [0, -1, 0.5, 721, '24', false, null, {}, []]) for (const op of ['deliveries.prepare', 'deliveries.create'])
+      await assert.rejects(f.owner.rpc(op, { fileId: f.fileId, recipient: 'reader', hours }), /INVALID_DELIVERY_EXPIRY/);
+    assert.equal(f.app.store.get('SELECT COUNT(*) AS n FROM deliveries')!.n, 0);
+  });
+  await run('期限幂等：重复与并发发送不同有效期也不延长现有授权', async f => {
+    f.setNow(Date.now()); const second = await f.login('owner');
+    const replies = await Promise.all([f.owner.rpc('deliveries.create', { fileId: f.fileId, recipient: 'reader', hours: 1 }), second.rpc('deliveries.create', { fileId: f.fileId, recipient: 'reader', hours: 720 })]);
+    assert.equal(replies[0].meta.deliveryId, replies[1].meta.deliveryId); assert.equal(replies[0].meta.expires, replies[1].meta.expires);
+    const expires = Number(replies[0].meta.expires); f.setNow(f.config.deliveryClock() + 300000);
+    assert.equal((await f.owner.rpc('deliveries.create', { fileId: f.fileId, recipient: 'reader', hours: 720 })).meta.expires, expires);
+    assert.equal(f.app.store.get('SELECT COUNT(*) AS n FROM deliveries')!.n, 1);
+  });
+  await run('到期边界：等于期限即拒绝初始化、续传、分块和扫描状态，所有者仍可读取', async f => {
+    const deliveryId = await f.send(), expires = f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires;
+    f.setNow(expires - 1); await f.reader.rpc('download.init', { fileId: f.fileId, deliveryId });
+    f.setNow(expires);
+    for (const [op, extra] of [['download.init', {}], ['download.init', { offset: 1, prefixHash: digest(f.bytes.subarray(0, 1)) }], ['download.chunk', { offset: 0 }], ['files.scan.status', {}]] as const)
+      await assert.rejects(f.reader.rpc(op, { fileId: f.fileId, deliveryId, ...extra }), /DELIVERY_EXPIRED/);
+    await assert.rejects(f.stranger.rpc('download.init', { fileId: f.fileId, deliveryId }), /NOT_FOUND/);
+    assert.equal((await f.owner.rpc('download.chunk', { fileId: f.fileId, offset: 0 })).payload.length, CHUNK);
+    assert.equal((await f.owner.rpc('storage.usage')).meta.used, f.bytes.length); assert.deepEqual(readFileSync(join(f.config.root, 'objects', f.fileId)), f.bytes);
+  });
+  await run('分块中到期：已取得首块后不能继续，也不能用已保存前缀恢复旧授权', async f => {
+    const deliveryId = await f.send(), first = await f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 });
+    assert.deepEqual(Buffer.from(first.payload), f.bytes.subarray(0, CHUNK));
+    f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires);
+    await assert.rejects(f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: CHUNK }), /DELIVERY_EXPIRED/);
+    await assert.rejects(f.reader.rpc('download.init', { fileId: f.fileId, deliveryId, offset: CHUNK, prefixHash: digest(first.payload) }), /DELIVERY_EXPIRED/);
+  });
+  await run('等待中到期：真实下载期限定时器及时取消五秒带宽等待，不发送内容', async f => {
+    const deliveryId = await f.send(); f.app.store.run('UPDATE deliveries SET expires=? WHERE id=?', Date.now() + 200, deliveryId);
+    f.app.bw.next.set(f.ids.reader, performance.now() + 5000); let payload = 0;
+    f.reader.ws.on('message', data => { payload += decode(Buffer.from(data as Buffer)).payload.length; });
+    const at = performance.now(); await assert.rejects(f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 }), /DELIVERY_EXPIRED/);
+    assert.ok(performance.now() - at < 1500); assert.equal(payload, 0);
+  });
+  await run('等待后复核：即使等待函数未处理取消信号，期限变化也不能读入文件', async f => {
+    const deliveryId = await f.send(); let begin!: () => void, release!: () => void;
+    const started = new Promise<void>(r => begin = r), gate = new Promise<void>(r => release = r); f.app.bw.take = async () => { begin(); await gate; };
+    const denied = assert.rejects(f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 }), /DELIVERY_EXPIRED/);
+    await started; f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires); release(); await denied;
+  });
+  await run('读取后到期：已读进缓冲的真实文件字节不能在到期后发送', async f => {
+    const deliveryId = await f.send(), original = fsPromises.open; let begin!: () => void, release!: () => void;
+    const started = new Promise<void>(r => begin = r), gate = new Promise<void>(r => release = r);
+    fsPromises.open = async (...args) => { const h = await original(...args); if (String(args[0]) === join(f.config.root, 'objects', f.fileId) && args[1] === 'r') { const read = h.read.bind(h); h.read = (async (...args: any[]) => { const result = await (read as any)(...args); begin(); await gate; return result; }) as typeof h.read; } return h; }; syncBuiltinESMExports();
+    const denied = assert.rejects(f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 }), /DELIVERY_EXPIRED/);
+    try { await started; f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires); release(); await denied; }
+    finally { release(); fsPromises.open = original; syncBuiltinESMExports(); }
+  });
+  await run('续传校验中到期：真实异步前缀摘要完成后仍须拒绝旧授权', async f => {
+    const deliveryId = await f.send(), original = fs.createReadStream;
+    fs.createReadStream = (...args) => { const stream = original(...args); if (String(args[0]) === join(f.config.root, 'objects', f.fileId)) queueMicrotask(() => f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires)); return stream; }; syncBuiltinESMExports();
+    try { await assert.rejects(f.reader.rpc('download.init', { fileId: f.fileId, deliveryId, offset: CHUNK, prefixHash: digest(f.bytes.subarray(0, CHUNK)) }), /DELIVERY_EXPIRED/); }
+    finally { fs.createReadStream = original; syncBuiltinESMExports(); }
+  });
+  await run('响应前到期：下载开始事件之后、分块响应之前再次复核期限', async f => {
+    const deliveryId = await f.send(), original = f.app.store.audit;
+    f.app.store.audit = function(user, action, result, detail) { const row = original.call(this, user, action, result, detail); if (action === 'deliveries.download') queueMicrotask(() => f.setNow(this.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires)); return row; };
+    try { await assert.rejects(f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 }), /DELIVERY_EXPIRED/); }
+    finally { f.app.store.audit = original; }
+  });
+  await run('重新发送：到期后创建新标识和期限，旧授权不因重发或时钟回退复活', async f => {
+    const old = await f.send(), expires = f.app.store.get('SELECT expires FROM deliveries WHERE id=?', old)!.expires; f.setNow(expires);
+    const next = (await f.owner.rpc('deliveries.create', { fileId: f.fileId, recipient: 'reader', hours: 1 })).meta;
+    assert.notEqual(next.deliveryId, old); assert.equal(next.expires, expires + 3600000);
+    const rows = await list(f.reader); assert.equal(rows.length, 2); assert.equal(rows.find(r => r.deliveryId === old)!.expired, true);
+    f.setNow(expires - 1000); await assert.rejects(f.reader.rpc('download.init', { fileId: f.fileId, deliveryId: old }), /DELIVERY_EXPIRED/);
+    assert.equal((await f.reader.rpc('download.chunk', { fileId: f.fileId, deliveryId: next.deliveryId, offset: 0 })).payload.length, CHUNK);
+    assert.equal((await f.owner.rpc('storage.usage')).meta.used, f.bytes.length); assert.equal((await f.reader.rpc('storage.usage')).meta.used, 0);
+  });
+  await run('到期审计：后台状态持久化且事件仅对双方和管理员可见，不重复写入', async f => {
+    const deliveryId = await f.send(); f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires);
+    for (let n = 0; n < 100 && !f.app.store.get('SELECT revoked FROM deliveries WHERE id=?', deliveryId)!.revoked; n++) await new Promise(r => setTimeout(r, 25));
+    assert.equal(f.app.store.get('SELECT reason FROM deliveries WHERE id=?', deliveryId)!.reason, 'expired');
+    for (const peer of [f.owner, f.reader, f.admin]) assert.equal(((await peer.rpc('events.list')).meta.events as any[]).filter(e => e.action === 'deliveries.expire' && e.detail.deliveryId === deliveryId).length, 1);
+    assert.equal(((await f.stranger.rpc('events.list')).meta.events as any[]).some(e => e.detail.deliveryId === deliveryId), false);
+    await f.owner.rpc('deliveries.revoke', { deliveryId }); assert.equal(f.app.store.all('SELECT event FROM audit').map(r => JSON.parse(r.event)).filter(e => e.action === 'deliveries.expire' && e.detail.deliveryId === deliveryId).length, 1);
+  });
+  await run('审计失败：到期重发事务回滚，旧授权仍拒绝，恢复后才能创建新授权', async f => {
+    const deliveryId = await f.send(); f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires);
+    const original = f.app.store.audit; f.app.store.audit = function(user, action, ...args) { if (action === 'deliveries.expire') throw Error('INJECTED_AUDIT_FAILURE'); return original.call(this, user, action, ...args); };
+    try { await assert.rejects(f.send(), /INTERNAL_ERROR/); assert.equal(f.app.store.get('SELECT revoked FROM deliveries WHERE id=?', deliveryId)!.revoked, 0); assert.equal(f.app.store.get('SELECT COUNT(*) AS n FROM deliveries')!.n, 1); await assert.rejects(f.reader.rpc('download.init', { fileId: f.fileId, deliveryId }), /DELIVERY_EXPIRED/); }
+    finally { f.app.store.audit = original; }
+    assert.notEqual(await f.send(), deliveryId);
+  });
+  await run('重启期限：有效、已到期及旧版无期限授权保持，不能改写到期时间', async f => {
+    const timed = await f.send(), legacy = await f.send('stranger'); f.app.store.run('UPDATE deliveries SET expires=0 WHERE id=?', legacy);
+    const expires = f.app.store.get('SELECT expires FROM deliveries WHERE id=?', timed)!.expires; f.setNow(expires); await f.restart();
+    const reader = await f.login('reader'), stranger = await f.login('stranger');
+    await assert.rejects(reader.rpc('download.init', { fileId: f.fileId, deliveryId: timed }), /DELIVERY_EXPIRED/);
+    assert.equal(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', timed)!.expires, expires);
+    assert.equal((await stranger.rpc('download.chunk', { fileId: f.fileId, deliveryId: legacy, offset: 0 })).payload.length, CHUNK);
+    assert.equal((await list(stranger))[0].expires, 0); assert.equal((await list(reader))[0].expired, true);
+  });
+  await run('加密恢复期限：完整保存新旧授权及原检查点，恢复不会延长或放开到期授权', async f => {
+    const timed = await f.send(), legacy = await f.send('stranger'); f.app.store.run('UPDATE deliveries SET expires=0 WHERE id=?', legacy);
+    await changeBackupKeys(f.config.root + '.backup-keys'); const result = (await f.admin.rpc('maintenance.backup')).meta;
+    const source = f.config.root + '.backups/' + result.id, access = { keyFile: f.config.root + '.backup-keys' }, backup = await verifyBackup(source, undefined, access), target = f.config.root + '-restored';
+    await restoreBackup(source, target, backup.checkpoint, access); const restored = new Store(target);
+    try { assert.deepEqual(restored.all('SELECT * FROM deliveries ORDER BY id'), f.app.store.all('SELECT * FROM deliveries ORDER BY id')); assert.equal(restored.get('PRAGMA user_version')!.user_version, 7); assert.equal(verifyAudit(restored.all('SELECT * FROM audit ORDER BY seq'), backup.checkpoint).ok, true); }
+    finally { restored.close(); }
+    f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', timed)!.expires);
+    const restoredApp = createApp({ ...f.config, root: target }); restoredApp.server.listen(0, '127.0.0.1'); await once(restoredApp.server, 'listening');
+    try { const ws = new WebSocket(`wss://127.0.0.1:${(restoredApp.server.address() as any).port}/ws`, { ca, rejectUnauthorized: true, headers: { Origin: f.config.origin } }); await once(ws, 'open'); const reader = new Peer(ws); await reader.rpc('auth.password', { name: 'reader', password: pass }); await assert.rejects(reader.rpc('download.init', { fileId: f.fileId, deliveryId: timed }), /DELIVERY_EXPIRED/); }
+    finally { await restoredApp.close(); }
+    // Re-open the original fixture for the common audit/close checks.
+    await f.restart();
+  });
+  await run('版本六增量迁移：旧授权新增零期限，原身份、撤销、文件和审计指纹保留', async f => {
+    const deliveryId = await f.send(); f.app.store.db.exec('DROP INDEX deliveries_expiry; ALTER TABLE deliveries DROP COLUMN expires; PRAGMA user_version=6;');
+    const snapshot = () => JSON.parse(execFileSync(process.execPath, [resolve('scripts/data-snapshot.mjs')], { env: { ...process.env, DATA_DIR: f.config.root }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    const before = snapshot(); await f.restart(); const after = snapshot();
+    for (const [table, records] of Object.entries(before.tables)) for (const [id, hash] of Object.entries(records as Record<string, string>)) assert.equal(after.tables[table][id], hash);
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires, 0);
+    const reader = await f.login('reader'); assert.equal((await reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 })).payload.length, CHUNK);
   });
   return results;
 }

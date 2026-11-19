@@ -69,7 +69,7 @@ try {
     Assert-Condition ($buildContexts.Count -eq 1 -and $buildContexts[0].Name -eq 'vendor_package' -and [IO.Path]::GetFullPath([string]$buildContexts[0].Value) -eq [IO.Path]::GetFullPath([string]$vendorInput.context)) 'Unexpected scanner build context.'
     Write-Host "PASS verified scanner vendor cache ($($vendorInput.bytes) bytes, $($vendorInput.from)); build will not redownload it."
     $scannerBuildInput = [ordered]@{ verified = $true; bytes = $vendorInput.bytes; sha256 = $vendorInput.sha256; source = $vendorInput.from; localContextRequired = $true }
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-scanner-provenance.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-scanner-provenance.json', 'container-delivery-expiry.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
@@ -192,6 +192,11 @@ try {
     # Existing admin/alice/bob credentials and MFA settings are never changed.
     $mfaSource = Get-Content -LiteralPath 'tests/container-mfa.mjs' -Raw -Encoding UTF8
     $mfaArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
+    $expirySource = Get-Content -LiteralPath 'tests/container-delivery-expiry.mjs' -Raw -Encoding UTF8
+    $expiryResult = Invoke-DockerInput -InputText $expirySource -DockerArgs $mfaArgs | ConvertFrom-Json
+    Assert-Condition ([bool]$expiryResult.ok -and [bool]$expiryResult.realScanner -and [bool]$expiryResult.waitCancelled -and $expiryResult.databaseVersion -eq 7) 'Delivery expiry verification failed inside the final runtime.'
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-delivery-expiry.json'), ($expiryResult | ConvertTo-Json -Depth 5), $utf8)
+    Write-Host 'PASS timed delivery, expiry cancellation, legacy grants, restart and encrypted restore in isolated temporary accounts.'
     # Real patched engine in the actual final images; only fresh /tmp accounts and samples.
     $scanSource = (Get-Content -LiteralPath 'tests/scan-samples.mjs' -Raw -Encoding UTF8) + "`n" + (Get-Content -LiteralPath 'tests/container-scan.mjs' -Raw -Encoding UTF8)
     $scanResult = Invoke-DockerInput -InputText $scanSource -DockerArgs $mfaArgs | ConvertFrom-Json
@@ -246,7 +251,7 @@ try {
     Assert-Condition ((Get-FileHash -LiteralPath $hostBackupKeyAfter -Algorithm SHA256).Hash -eq $backupKeyHash) 'The independent backup key file changed after restart.'
     $backupResult | Add-Member -NotePropertyName stableKeyRing -NotePropertyValue $true
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-backup.json'), ($backupResult | ConvertTo-Json -Depth 5), $utf8)
-    $summary = [ordered]@{ version = 10; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance; scannerBuildInput = $scannerBuildInput }
+    $summary = [ordered]@{ version = 11; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance; scannerBuildInput = $scannerBuildInput; deliveryExpiry = $expiryResult }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

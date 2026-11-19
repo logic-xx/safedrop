@@ -16,6 +16,11 @@ try {
       if (table === 'file_scans') for (const field of ['state','checked','engine','signature','code']) delete row[field];
       // Additive defaults must match legacy users while existing status fields stay covered.
       if (table === 'users') { row.disabled ??= 0; row.authVersion ??= 0; }
+      if (table === 'deliveries') {
+        row.expires ??= 0;
+        // Timed grants may be durably marked expired; immutable identity and deadline remain covered.
+        if (row.expires > 0 && (!row.revoked || row.reason === 'expired')) for (const field of ['revoked','revokedAt','reason']) delete row[field];
+      }
       const normalized = Object.fromEntries(Object.keys(row).sort().map(key => [key, row[key]]));
       const recordId = table === 'mfa_recovery' ? `${row.userId}:${row.hash}` : row.id ?? row.seq ?? row.key ?? row.sessionId ?? row.userId ?? row.fileId;
       if (recordId === undefined) throw new Error('SNAPSHOT_RECORD_ID_REQUIRED');

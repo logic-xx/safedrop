@@ -39,10 +39,18 @@ export function imagePolicy(report) {
   return { ok: blocked.length === 0, status: blocked.length ? 'failed' : 'passed', artifact: report.ArtifactName, imageId: report.Metadata?.ImageID ?? null, repoDigests: report.Metadata?.RepoDigests ?? [], findings, blocked: blocked.length };
 }
 export function scanRuntimePolicy(report) {
-  assert.equal(report.version,10,'SCANNING_CONTAINER_REPORT_V10_REQUIRED');
+  assert.equal(report.version,11,'SCANNING_CONTAINER_REPORT_V11_REQUIRED');
   const scan=report.scanning;
-  assert.ok(scan && scan.databaseVersion===6 && secureNode24(scan.node) && /^ClamAV 1\.5\.5\//.test(scan.engine??''),'PATCHED_SCANNER_RUNTIME_REQUIRED');
+  assert.ok(scan && scan.databaseVersion===7 && secureNode24(scan.node) && /^ClamAV 1\.5\.5\//.test(scan.engine??''),'PATCHED_SCANNER_RUNTIME_REQUIRED');
   for(const field of ['ok','malwareApi','encryptedArchiveRejected','recursionLimitRejected','unavailableRejected','legacyDefaultBlocked','expiryRejected','restart','encryptedBackupRestore']) assert.equal(scan[field],true,'REAL_SCANNER_CHECK_REQUIRED:'+field);
   for(const field of ['originalAccountsChanged','originalDataChanged']) assert.equal(scan[field],false,'SCANNER_FIXTURE_ISOLATION_REQUIRED');
   return scan;
+}
+export function expiryRuntimePolicy(report) {
+  assert.equal(report.version,11,'DELIVERY_EXPIRY_CONTAINER_REPORT_V11_REQUIRED');
+  const expiry=report.deliveryExpiry;
+  assert.ok(expiry && expiry.platform==='linux' && expiry.databaseVersion===7 && secureNode24(expiry.node),'DELIVERY_EXPIRY_FINAL_LINUX_RUNTIME_REQUIRED');
+  for(const field of ['ok','realScanner','strictDeadline','waitCancelled','restart','legacy','resend','encryptedBackupRestore']) assert.equal(expiry[field],true,'DELIVERY_EXPIRY_CHECK_REQUIRED:'+field);
+  for(const field of ['originalAccountsChanged','originalDataChanged']) assert.equal(expiry[field],false,'DELIVERY_EXPIRY_FIXTURE_ISOLATION_REQUIRED');
+  return expiry;
 }

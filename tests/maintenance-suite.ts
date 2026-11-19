@@ -231,7 +231,7 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
   await run('版本 3 迁移：既有数据行和审计不改写，旧任务按原创建时间判定', async f => {
     const id = await f.upload(Buffer.alloc(13), f.owner, false); f.app.store.db.exec('DROP TABLE mfa_settings; DROP TABLE mfa_recovery; DROP TABLE mfa_sessions; DROP TABLE mfa_attempts; DROP TABLE transfer_activity; PRAGMA user_version=3;');
     const before = JSON.stringify(f.app.store.all('SELECT * FROM transfers')); const anchor = f.app.store.checkpoint(); await f.restart();
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 6); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM transfers')), before); assert.equal(verifyAudit(f.app.store.all('SELECT * FROM audit ORDER BY seq'), anchor).ok, true); assert.ok(f.app.store.get('SELECT id FROM transfers WHERE id=?', id));
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM transfers')), before); assert.equal(verifyAudit(f.app.store.all('SELECT * FROM audit ORDER BY seq'), anchor).ok, true); assert.ok(f.app.store.get('SELECT id FROM transfers WHERE id=?', id));
   });
   return results;
 }

@@ -204,7 +204,7 @@ async function download(row: Row) {
     }
   } catch (e) {
     t.error = human(e); t.paused = true;
-    if (e instanceof Error && ['NOT_FOUND', 'FILE_DELETING', 'DELIVERY_UNAVAILABLE'].includes(e.message)) { t.terminal = row.deliveryId ? '接收授权已失效' : e.message === 'NOT_FOUND' ? '源文件已删除' : '源文件待删除'; await localPut(cacheKey, undefined); }
+    if (e instanceof Error && ['NOT_FOUND', 'FILE_DELETING', 'DELIVERY_UNAVAILABLE', 'DELIVERY_EXPIRED'].includes(e.message)) { t.terminal = row.deliveryId ? e.message === 'DELIVERY_EXPIRED' ? '接收授权已到期' : '接收授权已失效' : e.message === 'NOT_FOUND' ? '源文件已删除' : '源文件待删除'; await localPut(cacheKey, undefined); }
     if (e instanceof Error && ['PREFIX_MISMATCH', 'HASH_MISMATCH'].includes(e.message)) {
       await localPut(cacheKey, undefined);
       if (writer) { await writer.abort().catch(() => {}); writer = undefined; }

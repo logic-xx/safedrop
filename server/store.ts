@@ -41,7 +41,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
     // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
     const version = this.get('PRAGMA user_version')!.user_version;
-    need(version <= 6, 'DATABASE_VERSION_UNSUPPORTED');
+    need(version <= 7, 'DATABASE_VERSION_UNSUPPORTED');
     if (version < 1) this.transaction(() => {
       this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
@@ -78,6 +78,11 @@ export class Store {
       this.db.exec(`CREATE TABLE IF NOT EXISTS file_scans(fileId TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,sha256 TEXT NOT NULL,size INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','scanning','clean','quarantined','error')),generation TEXT NOT NULL,requested INTEGER NOT NULL,checked INTEGER NOT NULL DEFAULT 0,engine TEXT NOT NULL DEFAULT '',signature TEXT NOT NULL DEFAULT '',code TEXT NOT NULL DEFAULT '');
         CREATE INDEX IF NOT EXISTS file_scans_queue ON file_scans(state,requested,fileId);
         PRAGMA user_version=6;`);
+    });
+    if (version < 7) this.transaction(() => {
+      if (!this.all('PRAGMA table_info(deliveries)').some(column => column.name === 'expires'))
+        this.db.exec('ALTER TABLE deliveries ADD COLUMN expires INTEGER NOT NULL DEFAULT 0 CHECK(expires>=0);');
+      this.db.exec('CREATE INDEX IF NOT EXISTS deliveries_expiry ON deliveries(expires) WHERE revoked=0 AND expires>0; PRAGMA user_version=7;');
     });
     this.auditBytes = this.get('SELECT COALESCE(SUM(length(CAST(event AS BLOB))+128),0) AS n FROM audit')!.n;
   }

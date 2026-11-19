@@ -4,16 +4,22 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { join, resolve, sep } from 'node:path';
-import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy } from '../scripts/ci/policy.mjs';
+import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy, expiryRuntimePolicy } from '../scripts/ci/policy.mjs';
 test('CI runtime evidence requires a security-patched supported Node 24 version',()=>{
   for(const version of ['v24.14.0','v24.22.0','v24.22.2','v25.0.0','v26.0.0','v24.22.3-rc.1','']) assert.equal(secureNode24(version),false,version);
   for(const version of ['v24.22.3','24.22.4','v24.23.0']) assert.equal(secureNode24(version),true,version);
 });
 test('Scanner container evidence rejects a host-only probe, old engine or incomplete isolation',()=>{
-  const scanning={node:'v24.22.3',engine:'ClamAV 1.5.5/123/date',databaseVersion:6,ok:true,malwareApi:true,encryptedArchiveRejected:true,recursionLimitRejected:true,unavailableRejected:true,legacyDefaultBlocked:true,expiryRejected:true,restart:true,encryptedBackupRestore:true,originalAccountsChanged:false,originalDataChanged:false};
-  const report={version:10,scanning};assert.equal(scanRuntimePolicy(report),scanning);
-  for(const patch of [{malwareApi:false},{engine:'ClamAV 1.5.4/123/date'},{originalDataChanged:true},{encryptedArchiveRejected:undefined}])assert.throws(()=>scanRuntimePolicy({version:10,scanning:{...scanning,...patch}}));
-  assert.throws(()=>scanRuntimePolicy({version:9,scanning}));assert.throws(()=>scanRuntimePolicy({version:10}));
+  const scanning={node:'v24.22.3',engine:'ClamAV 1.5.5/123/date',databaseVersion:7,ok:true,malwareApi:true,encryptedArchiveRejected:true,recursionLimitRejected:true,unavailableRejected:true,legacyDefaultBlocked:true,expiryRejected:true,restart:true,encryptedBackupRestore:true,originalAccountsChanged:false,originalDataChanged:false};
+  const report={version:11,scanning};assert.equal(scanRuntimePolicy(report),scanning);
+  for(const patch of [{malwareApi:false},{engine:'ClamAV 1.5.4/123/date'},{originalDataChanged:true},{encryptedArchiveRejected:undefined}])assert.throws(()=>scanRuntimePolicy({version:11,scanning:{...scanning,...patch}}));
+  assert.throws(()=>scanRuntimePolicy({version:9,scanning}));assert.throws(()=>scanRuntimePolicy({version:11}));
+});
+test('Expiry runtime evidence rejects missing, host-only, partial or data-changing checks',()=>{
+  const deliveryExpiry={node:'v24.22.3',platform:'linux',databaseVersion:7,ok:true,realScanner:true,strictDeadline:true,waitCancelled:true,restart:true,legacy:true,resend:true,encryptedBackupRestore:true,originalAccountsChanged:false,originalDataChanged:false};
+  assert.equal(expiryRuntimePolicy({version:11,deliveryExpiry}),deliveryExpiry);
+  assert.throws(()=>expiryRuntimePolicy({version:10,deliveryExpiry}));assert.throws(()=>expiryRuntimePolicy({version:11}));
+  for(const patch of [{platform:'win32'},{databaseVersion:6},{realScanner:false},{waitCancelled:false},{legacy:false},{encryptedBackupRestore:false},{originalDataChanged:true},{node:'v24.14.0'}])assert.throws(()=>expiryRuntimePolicy({version:11,deliveryExpiry:{...deliveryExpiry,...patch}}));
 });
 const empty = () => ({auditReportVersion:2,metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0,total:0}},vulnerabilities:{}});
 const advisory='https://example.invalid/advisory', now=Date.parse('2026-11-18T00:00:00Z');
