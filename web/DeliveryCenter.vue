@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted, nextTick } from 'vue';
 import { human } from './client.ts';
 import type { Frame, Metadata } from '../shared/protocol.ts';
+import ScanBadge from './ScanBadge.vue';
 type Row = Record<string, any>;
 const props = defineProps<{ rpc: (op: string, meta?: Metadata) => Promise<Frame>; download: (row: Row) => Promise<void>; preparing: (row: Row) => boolean }>();
 const incoming = ref<Row[]>([]), sent = ref<Row[]>([]), inOffset = ref(0), outOffset = ref(0), busy = ref(false), notice = ref(''), target = ref<Row>(), feedback = ref<HTMLElement>(), confirmPanel = ref<HTMLElement>();
@@ -23,7 +24,7 @@ defineExpose({ refresh });
   <div v-if="notice" ref="feedback" class="notice account-notice" role="status" tabindex="-1">{{ notice }}</div>
   <section class="card"><div class="card-heading"><h3>收到的文件</h3><button class="secondary small" :disabled="busy" @click="action(refresh)">刷新收发记录</button></div>
     <p class="report-meta">文件仍属于发送者，不占用你的存储配额；下载使用你的账号带宽。授权失效后将从此列表移除。</p>
-    <div class="table-scroll"><table><thead><tr><th>文件</th><th>发送者</th><th>大小</th><th>发送时间</th><th></th></tr></thead><tbody><tr v-for="f in incoming" :key="f.deliveryId"><td><div class="file-name"><span class="file-icon">↓</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ f.sender }}</td><td>{{ size(f.size) }}</td><td>{{ time(f.sentAt) }}</td><td><button class="link" :disabled="preparing(f)" @click="download(f)">{{ preparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button></td></tr></tbody></table></div><div v-if="!incoming.length" class="empty">当前没有可下载的接收文件</div>
+    <div class="table-scroll"><table><thead><tr><th>文件</th><th>发送者</th><th>大小</th><th>发送时间</th><th></th></tr></thead><tbody><tr v-for="f in incoming" :key="f.deliveryId"><td><div class="file-name"><span class="file-icon">↓</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ f.sender }}</td><td>{{ size(f.size) }}</td><td>{{ time(f.sentAt) }}<ScanBadge :scan="f.scan" /></td><td><button class="link" :disabled="preparing(f) || f.scan?.state !== 'clean'" @click="download(f)">{{ preparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button></td></tr></tbody></table></div><div v-if="!incoming.length" class="empty">当前没有可下载的接收文件</div>
     <div class="account-pagination"><button class="secondary small" :disabled="busy || inOffset === 0" @click="inOffset -= 12; action(refresh)">上一页收到的文件</button><button class="secondary small" :disabled="busy || incoming.length < 12" @click="inOffset += 12; action(refresh)">下一页收到的文件</button></div>
   </section>
   <section class="card"><div class="card-heading"><h3>已发送的授权</h3><span class="muted">显示授权状态，不表示对方已读</span></div>

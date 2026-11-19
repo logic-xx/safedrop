@@ -5,21 +5,27 @@ import { once } from 'node:events';
 import { generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { WebSocket } from 'ws';
-import { createApp } from '../server/app.ts';
+import { createTestApp as createApp, scanFixtureFile } from './test-scanner.ts';
+import { setTimeout as pause } from 'node:timers/promises';
 import { digest, verifyAudit, type Row } from '../server/store.ts';
 import { encode, decode, CHUNK, MAX_FRAME, type Metadata, type Frame } from '../shared/protocol.ts';
 import { certificates } from '../scripts/certificates.ts';
 
 export class Peer {
   seq = 0; pending = new Map<number, { yes: (f: Frame) => void; no: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
-  constructor(public ws: WebSocket) {
+  constructor(public ws: WebSocket, private waitForScan = true) {
     ws.on('message', data => { const f = decode(Buffer.from(data as Buffer)); const p = this.pending.get(f.requestId); if (p) { clearTimeout(p.timer); this.pending.delete(f.requestId); f.meta.ok ? p.yes(f) : p.no(new Error(String(f.meta.code))); } });
     ws.on('error', () => {});
     ws.on('close', () => { for (const p of this.pending.values()) { clearTimeout(p.timer); p.no(new Error('CLOSED')); } this.pending.clear(); });
   }
-  rpc(op: string, meta: Metadata = {}, payload?: Uint8Array) {
+  async rpc(op: string, meta: Metadata = {}, payload?: Uint8Array): Promise<Frame> {
     const n = ++this.seq;
-    return new Promise<Frame>((yes, no) => { const timer = setTimeout(() => { this.pending.delete(n); no(new Error('TIMEOUT')); }, 6000); this.pending.set(n, { yes, no, timer }); this.ws.send(encode(1, n, { op, ...meta }, payload)); });
+    const frame = await new Promise<Frame>((yes, no) => { const timer = setTimeout(() => { this.pending.delete(n); no(new Error('TIMEOUT')); }, 6000); this.pending.set(n, { yes, no, timer }); this.ws.send(encode(1, n, { op, ...meta }, payload)); });
+    if (op === 'upload.finish' && this.waitForScan) {
+      for (let i = 0; i < 200; i++) { const result = await this.rpc('files.scan.status', { fileId: frame.meta.fileId }); if (!['pending','scanning'].includes(String((result.meta.scan as Row).state))) return frame; await pause(10); }
+      throw Error('CONTROLLED_UPLOAD_SCAN_TIMEOUT');
+    }
+    return frame;
   }
 }
 export interface Result { name: string; ok: boolean; ms: number; detail: string }
@@ -88,7 +94,7 @@ export async function runSuite(onResult?: (r: Result) => void) {
     await run('带宽：VIP 差异及跨连接账号聚合限速', async () => {
       const normalId = await app.store.addUser('speed-normal', pass), vipId = await app.store.addUser('speed-vip', pass, 'user', 'vip');
       const payload = randomBytes(2 * 1024 ** 2), sha = digest(payload), nf = crypto.randomUUID(), vf = crypto.randomUUID();
-      for (const [fid, uid] of [[nf, normalId], [vf, vipId]]) { await writeFile(join(config.root, 'objects', fid), payload); app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', fid, uid, 'speed.bin', payload.length, sha, Date.now()); }
+      for (const [fid, uid] of [[nf, normalId], [vf, vipId]]) { await writeFile(join(config.root, 'objects', fid), payload); app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', fid, uid, 'speed.bin', payload.length, sha, Date.now()); await scanFixtureFile(app, fid); }
       const p1 = await connect(), p2 = await connect(), pv = await connect();
       await p1.rpc('auth.password', { name: 'speed-normal', password: pass }); await p2.rpc('auth.password', { name: 'speed-normal', password: pass }); await pv.rpc('auth.password', { name: 'speed-vip', password: pass });
       const start = performance.now(); await Promise.all([p1, p2].map(async p => { for (let i = 0; i < 4; i++) assert.equal((await p.rpc('download.chunk', { fileId: nf, offset: i * CHUNK })).payload.length, CHUNK); })); const normalMs = performance.now() - start;

@@ -31,13 +31,18 @@ class Peer {
     });
     ws.on('close', () => this.close(new Error('CONNECTION_CLOSED')));
   }
-  rpc(op: string, meta: Metadata = {}, payload?: Uint8Array) {
+  async rpc(op: string, meta: Metadata = {}, payload?: Uint8Array): Promise<Frame> {
     const requestId = ++this.seq;
-    return new Promise<Frame>((resolve, reject) => {
+    const frame = await new Promise<Frame>((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error('RPC_TIMEOUT')); }, 10000);
       this.pending.set(requestId, { resolve, reject, timer });
       this.ws.send(encode(1, requestId, { op, ...meta }, payload));
     });
+    if (op === 'upload.finish') {
+      for (let attempt = 0; attempt < 900; attempt++) { const status = (await this.rpc('files.scan.status', { fileId: frame.meta.fileId })).meta.scan as Metadata; if (status.state === 'clean') return frame; if (status.state === 'error' || status.state === 'quarantined') throw Error('DEPLOYMENT_SCAN_NOT_CLEAN:' + status.code); await pause(100); }
+      throw Error('DEPLOYMENT_SCAN_TIMEOUT');
+    }
+    return frame;
   }
   close(error = new Error('CHECK_FINISHED')) {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }

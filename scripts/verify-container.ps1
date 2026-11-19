@@ -39,6 +39,14 @@ try {
     $configuredGatewayNetworks = @($composeModel.services.gateway.networks.PSObject.Properties.Name)
     $configuredIngress = @($configuredGatewayNetworks | Where-Object { -not [bool]$composeModel.networks.PSObject.Properties[$_].Value.internal })
     Assert-Condition ($configuredGatewayNetworks.Count -eq 2 -and $configuredGatewayNetworks -contains $backendName -and $configuredIngress.Count -eq 1) 'The gateway needs the shared backend and one non-internal ingress network to publish its HTTPS port.'
+    $configuredScanner = $composeModel.services.scanner
+    $scannerNetworks = @($configuredScanner.networks.PSObject.Properties.Name)
+    Assert-Condition ($configuredScanner.user -eq '65532:65532' -and [bool]$configuredScanner.read_only) 'The scanner must have a non-root identity and read-only root.'
+    Assert-Condition (@($configuredScanner.ports | Where-Object { $null -ne $_ }).Count -eq 0) 'The unauthenticated scanner must not publish a host port.'
+    Assert-Condition ($scannerNetworks.Count -eq 2 -and $scannerNetworks -contains $backendName -and $scannerNetworks -contains 'signatures') 'The scanner requires the backend and isolated signature-update egress.'
+    $scannerVolumes = @($configuredScanner.volumes)
+    Assert-Condition ($scannerVolumes.Count -eq 1 -and $scannerVolumes[0].type -eq 'volume' -and $scannerVolumes[0].source -eq 'scanner_data' -and $scannerVolumes[0].target -eq '/data') 'The scanner may mount only its own signature data volume.'
+    Assert-Condition ($composeModel.services.app.environment.CLAMD_HOST -eq 'scanner') 'Application scanning must use the isolated scanner service.'
     Assert-Condition (Test-Path -LiteralPath 'node_modules/tsx/dist/cli.mjs') 'Run npm ci before verification.'
     if ($CheckOnly) { Write-Host 'PASS Compose configuration and local prerequisites. No engine access or containers changed.'; return }
     $engineType = (& docker info --format '{{.OSType}}')
@@ -47,7 +55,7 @@ try {
     $privateDir = Join-Path $projectRoot '.local/container-check'
     New-Item -ItemType Directory -Path $privateDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $projectRoot 'reports') -Force | Out-Null
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
@@ -72,7 +80,7 @@ try {
     Write-Host 'Building and starting isolated project safedrop-check on https://localhost:18443 ...'
     # Mounted Caddyfile changes require a new process even if its path is stable.
     # Recreating these verification containers preserves their named data volumes.
-    Invoke-DockerChecked @composeArgs up --build --force-recreate --detach --wait --wait-timeout 180
+    Invoke-DockerChecked @composeArgs up --build --force-recreate --detach --wait --wait-timeout 600
     $existingData = [ordered]@{ checked = $false; records = 0 }
     if ($null -ne $existingSnapshot) {
         $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
@@ -118,13 +126,16 @@ try {
     Write-Host 'PASS running gateway Go/dependency versions; legacy go-jose is absent.'
     $appId = (Invoke-DockerChecked @composeArgs ps --quiet app).Trim()
     $gatewayId = (Invoke-DockerChecked @composeArgs ps --quiet gateway).Trim()
+    $scannerId = (Invoke-DockerChecked @composeArgs ps --quiet scanner).Trim()
     $appInfo = @(Invoke-DockerChecked inspect $appId | ConvertFrom-Json)[0]
     $gatewayInfo = @(Invoke-DockerChecked inspect $gatewayId | ConvertFrom-Json)[0]
+    $scannerInfo = @(Invoke-DockerChecked inspect $scannerId | ConvertFrom-Json)[0]
     # Save only non-secret configuration so a failed check can be diagnosed.
     $runtimeEvidence = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); appUser = $appInfo.Config.User; appNetworks = @($appInfo.NetworkSettings.Networks.PSObject.Properties.Name); gatewayNetworks = @($gatewayInfo.NetworkSettings.Networks.PSObject.Properties.Name); gatewayRequestedPorts = $gatewayInfo.HostConfig.PortBindings; gatewayPublishedPorts = $gatewayInfo.NetworkSettings.Ports }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-runtime.json'), ($runtimeEvidence | ConvertTo-Json -Depth 6), $utf8)
     Assert-Condition ($appInfo.Config.User -eq '10001:10001') 'The application is not running as UID/GID 10001.'
-    foreach ($serviceInfo in @($appInfo, $gatewayInfo)) {
+    Assert-Condition ($scannerInfo.Config.User -eq '65532:65532') 'The scanner is not running as UID/GID 65532.'
+    foreach ($serviceInfo in @($appInfo, $gatewayInfo, $scannerInfo)) {
         Assert-Condition ([bool]$serviceInfo.HostConfig.ReadonlyRootfs) 'A container root filesystem is writable.'
         Assert-Condition ($serviceInfo.HostConfig.CapDrop -contains 'ALL') 'A container has not dropped all capabilities.'
         Assert-Condition (@($serviceInfo.HostConfig.SecurityOpt | Where-Object { $_ -match '^no-new-privileges(:true)?$' }).Count -gt 0) 'Privilege escalation is not disabled.'
@@ -132,6 +143,14 @@ try {
     }
     $appPublished = @($appInfo.NetworkSettings.Ports.PSObject.Properties | Where-Object { $null -ne $_.Value })
     Assert-Condition ($appPublished.Count -eq 0) 'The application has a published host port.'
+    $scannerPublished = @($scannerInfo.NetworkSettings.Ports.PSObject.Properties | Where-Object { $null -ne $_.Value })
+    Assert-Condition ($scannerPublished.Count -eq 0) 'The scanner has a published host port.'
+    $actualScannerNetworks = @($scannerInfo.NetworkSettings.Networks.PSObject.Properties.Name)
+    Assert-Condition ($actualScannerNetworks.Count -eq 2 -and $actualScannerNetworks -contains $composeModel.networks.PSObject.Properties[$backendName].Value.name -and $actualScannerNetworks -contains $composeModel.networks.signatures.name) 'Unexpected scanner networks.'
+    $scannerDataName = $composeModel.volumes.scanner_data.name
+    $actualScannerMounts = @($scannerInfo.Mounts | Where-Object { $_.Type -ne 'tmpfs' })
+    Assert-Condition ($actualScannerMounts.Count -eq 1 -and $actualScannerMounts[0].Type -eq 'volume' -and $actualScannerMounts[0].Name -eq $scannerDataName -and $actualScannerMounts[0].Destination -eq '/data') 'The scanner mounted business data or an unexpected volume.'
+    Assert-Condition ($scannerInfo.HostConfig.Memory -eq 4GB -and $scannerInfo.HostConfig.Tmpfs.'/tmp' -eq 'size=1536m,noexec,nosuid,uid=65532,gid=65532,mode=0700') 'Scanner memory or temporary space bounds changed.'
     $networkNames = @($appInfo.NetworkSettings.Networks.PSObject.Properties.Name)
     Assert-Condition ($networkNames.Count -eq 1) 'The application is attached to unexpected networks.'
     $networkInfo = @(Invoke-DockerChecked network inspect $networkNames[0] | ConvertFrom-Json)[0]
@@ -145,12 +164,18 @@ try {
     $portDescription = ConvertTo-Json -InputObject $ports -Compress -Depth 3
     Assert-Condition ($ports.Count -gt 0) "The gateway HTTPS port was not published. Observed: $portDescription. See reports/container-runtime.json."
     Assert-Condition ($ports.Count -eq 1 -and $ports[0].HostIp -eq '127.0.0.1' -and $ports[0].HostPort -eq '18443') "Unexpected gateway port binding: $portDescription. Expected only 127.0.0.1:18443."
-    $profile = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); ok = $true; checks = @('Non-root application', 'Read-only roots', 'All capabilities dropped', 'Privilege escalation disabled', 'Memory/CPU/PID limits', 'Internal backend without published app ports', 'Separate gateway ingress network', 'Loopback-only gateway') }
+    $profile = [ordered]@{ created = [DateTime]::UtcNow.ToString('o'); ok = $true; checks = @('Non-root application and scanner', 'Read-only roots', 'All capabilities dropped', 'Privilege escalation disabled', 'Memory/CPU/PID limits', 'Internal backend without published app ports', 'Separate gateway ingress network', 'Loopback-only gateway', 'Scanner has no published port or business/key mounts', 'Scanner has bounded memory/tmp and separate signature-update egress') }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-profile.json'), ($profile | ConvertTo-Json -Depth 4), $utf8)
     # Exercise MFA in the actual final image using only a new /tmp fixture.
     # Existing admin/alice/bob credentials and MFA settings are never changed.
     $mfaSource = Get-Content -LiteralPath 'tests/container-mfa.mjs' -Raw -Encoding UTF8
     $mfaArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
+    # Real patched engine in the actual final images; only fresh /tmp accounts and samples.
+    $scanSource = (Get-Content -LiteralPath 'tests/scan-samples.mjs' -Raw -Encoding UTF8) + "`n" + (Get-Content -LiteralPath 'tests/container-scan.mjs' -Raw -Encoding UTF8)
+    $scanResult = Invoke-DockerInput -InputText $scanSource -DockerArgs $mfaArgs | ConvertFrom-Json
+    Assert-Condition ([bool]$scanResult.ok -and [bool]$scanResult.malwareApi -and $scanResult.engine -match '^ClamAV 1\.5\.5/') 'Real scanner API verification failed inside the final runtime.'
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-scan.json'), ($scanResult | ConvertTo-Json -Depth 5), $utf8)
+    Write-Host 'PASS real scanner, quarantine, archive limits, expiry, restart and encrypted restore in isolated temporary accounts.'
     $mfaResult = Invoke-DockerInput -InputText $mfaSource -DockerArgs $mfaArgs | ConvertFrom-Json
     Assert-Condition ([bool]$mfaResult.ok) 'Isolated MFA verification failed inside the final container image.'
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-mfa.json'), ($mfaResult | ConvertTo-Json -Depth 5), $utf8)
@@ -199,7 +224,7 @@ try {
     Assert-Condition ((Get-FileHash -LiteralPath $hostBackupKeyAfter -Algorithm SHA256).Hash -eq $backupKeyHash) 'The independent backup key file changed after restart.'
     $backupResult | Add-Member -NotePropertyName stableKeyRing -NotePropertyValue $true
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-backup.json'), ($backupResult | ConvertTo-Json -Depth 5), $utf8)
-    $summary = [ordered]@{ version = 9; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult }
+    $summary = [ordered]@{ version = 10; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

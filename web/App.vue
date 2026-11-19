@@ -1,3 +1,6 @@
+<style scoped>
+.file-buttons{flex-wrap:wrap;gap:4px 12px;min-width:145px;max-width:190px}
+</style>
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -10,6 +13,7 @@ import SendFile from './SendFile.vue';
 import DeliveryCenter from './DeliveryCenter.vue';
 import Maintenance from './Maintenance.vue';
 import MfaSettings from './MfaSettings.vue';
+import ScanBadge from './ScanBadge.vue';
 import { downloadReference, downloadAccess } from './download-reference.ts';
 type Row = Record<string, any>;
 type Task = { key: string; owner: string; name: string; kind: 'upload' | 'download'; total: number; done: number; status: string; paused: boolean; running?: boolean; file?: File; row?: Row; error?: string; transferId?: string; resumeKey?: string; terminal?: string };
@@ -150,6 +154,10 @@ async function fileChanged(mode: 'rename' | 'delete', file: Row) {
   }
   await attempt(refresh);
 }
+async function scanFile(file: Row) {
+  const scoped = sessionRequests(client, session.value, () => session.value);
+  await attempt(async () => { await scoped.rpc('files.scan', { fileId: file.id }); await refresh(); notice.value = '扫描请求已登记。只有扫描通过后才能下载和交付；检测到威胁或扫描失败时，原文件和占用仍保留。'; });
+}
 function downloadPreparing(row: Row) { return preparingDownloads.value.has(`${session.value}:${downloadReference(row as { id: string; deliveryId?: string })}`); }
 async function download(row: Row) {
   if (!user.value || active.value >= 3) { notice.value = '当前已有三个任务运行，请稍后重试'; return; }
@@ -237,7 +245,7 @@ onUnmounted(() => { clearInterval(poll); clearInterval(heartbeat); client.stop()
     <template v-if="tab === 'files'"><div class="stats"><article><span>已用空间</span><strong>{{ usage ? size(usage.used) : '—' }}</strong><p>已完成文件，含删除待重试的占用</p></article><article><span>上传预留空间</span><strong>{{ usage ? size(usage.reserved) : '—' }}</strong><p>未完成上传按完整文件大小预留</p></article><article><span>可用空间</span><strong>{{ usage ? size(usage.available) : '—' }}</strong><p>账号配额减去已用与预留空间</p></article></div><div class="quota-summary"><span>账号配额 {{ usage ? size(usage.limit) : '—' }}</span><span>我的文件 {{ usage?.fileCount ?? '—' }} 个</span><span>未完成上传 {{ usage?.transferCount ?? '—' }} 个</span><span>传输上限 {{ size(user.rate) }}/s · 双向及多会话共享</span></div><p v-if="usage?.overQuota" class="form-error">当前占用超过账号配额，请删除文件或取消未完成上传后再上传。</p>
 
     <section class="upload-zone" @dragover.prevent @drop.prevent="enqueue($event.dataTransfer?.files ?? null)"><div class="upload-icon">↑</div><div><h3>将文件拖到这里，开始安全传输</h3><p>支持多任务与断点续传 · 单文件最大 512 MB</p></div><button class="primary" @click="uploading?.click()">＋ 选择文件</button><input ref="uploading" hidden type="file" multiple @change="enqueue(($event.target as HTMLInputElement).files)"></section>
-    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"></div><div class="table-scroll"><table><thead><tr><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span></td><td class="file-buttons"><button class="link" :disabled="f.deleting || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting" @click="sending = f; fileAction = undefined">发送给用户</button><button class="link" :disabled="f.deleting" @click="sending = undefined; fileAction = { file: f, mode: 'rename' }">重命名</button><button class="link danger" @click="sending = undefined; fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td colspan="5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
+    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"></div><p class="report-meta">上传完成后自动进行本地安全扫描，通过后才可下载或发送。旧文件需要请求扫描；隔离或失败不会自动删除文件，也不会释放占用。</p><div class="table-scroll"><table><thead><tr><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性与扫描</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span><ScanBadge :scan="f.scan" /></td><td class="file-buttons"><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean' || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean'" @click="sending = f; fileAction = undefined">发送给用户</button><button class="link" :disabled="f.deleting || ['pending','scanning'].includes(f.scan?.state)" @click="scanFile(f)">{{ f.scan?.state === 'clean' ? '重新扫描' : f.scan?.state === 'error' || f.scan?.state === 'quarantined' ? '重试扫描' : '请求扫描' }}</button><button class="link" :disabled="f.deleting || f.scan?.state === 'scanning'" @click="sending = undefined; fileAction = { file: f, mode: 'rename' }">重命名</button><button class="link danger" @click="sending = undefined; fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td colspan="5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
     <SendFile v-if="sending" :key="sending.id" :file="sending" :rpc="accountRpc" @close="sending = undefined" />
     <FileAction v-if="fileAction" :key="fileAction.file.id + fileAction.mode" :file="fileAction.file" :mode="fileAction.mode" :rpc="accountRpc" @close="fileAction = undefined" @changed="fileChanged" @refresh="attempt(refresh)" />
 

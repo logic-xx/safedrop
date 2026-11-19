@@ -13,8 +13,10 @@ import { StorageGuard, type StoragePolicy } from './storage.ts';
 import { backupList, createBackup } from './backup.ts';
 import { backupKeyLocation, readBackupKeys, backupKeyInfo } from './backup-keys.ts';
 import { MfaGuard, base32, type MfaProof } from './mfa.ts';
+import { ScanGuard } from './scans.ts';
+import type { ScanEngine } from './clamd.ts';
 
-export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string }
+export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string; scanner?: ScanEngine; scanMaxAgeMs?: number; scanClock?: () => number }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
@@ -43,7 +45,12 @@ export function createApp(config: Config) {
   const operations = new Set<Promise<void>>();
   const activeDispatches = new Set<Promise<unknown>>();
   let maintenanceBusy = false, cleanupBusy = false, auditReserved = 0;
-  const readOnly = new Set(['hello', 'ping', 'files.list', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
+  const scans = new ScanGuard(store, config.scanner, locks, () => !maintenanceBusy, () => {
+    if (store.auditBytes + auditReserved + 8192 > store.auditLimit) return;
+    auditReserved += 8192; return () => { auditReserved -= 8192; };
+  }, config.scanMaxAgeMs, config.scanClock);
+  const scanFields = (file: Row) => { const { state, checked, code } = scans.status(file); return { ...file, scan: { state, checked, code } }; };
+  const readOnly = new Set(['hello', 'ping', 'files.list', 'files.scan.status', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
   type DownloadJob = { abort: AbortController; done: Promise<void>; userId: string; ownerId: string; deliveryId?: string };
   const downloads = new Map<string, Set<DownloadJob>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
@@ -136,7 +143,7 @@ export function createApp(config: Config) {
   function available(c: Context, table: 'transfers' | 'files', targetId: unknown) {
     const row = owned(c, table, targetId); notDeleting(table, row.id); return row;
   }
-  function readable(c: Context, fileId: unknown, deliveryId?: unknown): { file: Row; delivery?: Row } {
+  function accessible(c: Context, fileId: unknown, deliveryId?: unknown): { file: Row; delivery?: Row } {
     const u = authorized(c), fid = text(fileId, 80);
     if (deliveryId === undefined) return { file: available(c, 'files', fid) };
     const delivery = store.get('SELECT d.*,o.name AS sender,r.name AS recipient,o.disabled AS ownerDisabled FROM deliveries d JOIN users o ON o.id=d.ownerId JOIN users r ON r.id=d.recipientId WHERE d.id=? AND d.fileId=? AND d.recipientId=?', text(deliveryId, 80), fid, u.id);
@@ -145,6 +152,9 @@ export function createApp(config: Config) {
     need(!delivery.revoked && !delivery.ownerDisabled && file && !store.get("SELECT id FROM deletions WHERE id=? AND kind='files'", fid), 'DELIVERY_UNAVAILABLE');
     return { file, delivery };
   }
+  function readable(c: Context, fileId: unknown, deliveryId?: unknown) {
+    const access = accessible(c, fileId, deliveryId); scans.requireClean(access.file); return access;
+  }
   function deliveryAudit(c: Context, action: string, d: Row, extra: Row = {}) {
     audit(c, action, 'allowed', { deliveryId: d.id, fileId: d.fileId, ownerId: d.ownerId, recipientId: d.recipientId, sender: d.sender, recipient: d.recipient, ...extra });
   }
@@ -152,9 +162,9 @@ export function createApp(config: Config) {
     const rows = store.all(`SELECT d.*,o.name AS sender,r.name AS recipient FROM deliveries d JOIN users o ON o.id=d.ownerId JOIN users r ON r.id=d.recipientId WHERE d.revoked=0 AND (${where})`, ...args);
     for (const d of rows) { store.run('UPDATE deliveries SET revoked=1,revokedAt=?,reason=? WHERE id=?', Date.now(), reason, d.id); deliveryAudit(c, 'deliveries.revoke', d, { reason }); }
   }
-  function stopDownloads(predicate: (job: DownloadJob) => boolean) {
+  function stopDownloads(predicate: (job: DownloadJob) => boolean, reason?: Fault) {
     const jobs = [...downloads.values()].flatMap(set => [...set]).filter(predicate);
-    for (const job of jobs) job.abort.abort();
+    for (const job of jobs) job.abort.abort(reason);
     return Promise.all(jobs.map(job => job.done));
   }
   function downloadStarted(c: Context, access: { file: Row; delivery?: Row }, offset: number, explicit: boolean) {
@@ -172,11 +182,12 @@ export function createApp(config: Config) {
     const job: DownloadJob = { abort, done: new Promise<void>(r => { settled = r; }), userId: c.user!.id, ownerId: access.file.userId, deliveryId: access.delivery?.id };
     let jobs = downloads.get(fileId); if (!jobs) downloads.set(fileId, jobs = new Set()); jobs.add(job);
     try { return await fn(AbortSignal.any([c.abort.signal, abort.signal])); }
-    catch (e) { if (abort.signal.aborted) throw new Fault(job.deliveryId ? 'DELIVERY_UNAVAILABLE' : 'FILE_DELETING'); throw e; }
+    catch (e) { if (abort.signal.aborted) throw abort.signal.reason instanceof Fault ? abort.signal.reason : new Fault(job.deliveryId ? 'DELIVERY_UNAVAILABLE' : 'FILE_DELETING'); throw e; }
     finally { jobs.delete(job); if (!jobs.size) downloads.delete(fileId); settled(); }
   }
   async function erase(c: Context, table: 'transfers' | 'files', targetId: unknown, expired?: Row) {
     const row = expired ?? owned(c, table, targetId), op = expired ? 'maintenance.expire' : table === 'files' ? 'files.delete' : 'upload.cancel';
+    if (table === 'files') { await scans.cancel(row.id); if (!expired) owned(c, table, row.id); }
     need(!locks.has(row.id), table === 'files' ? 'FILE_BUSY' : 'TRANSFER_BUSY'); locks.add(row.id);
     try {
       // The durable intent stops future access, but keeps the original row charged.
@@ -335,7 +346,7 @@ export function createApp(config: Config) {
       let backupEncryption: Record<string, unknown>;
       try { await backupKeyLocation(backupKeyFile, config.root, backupRoot, resolve(config.mfaKeyFile ?? config.root + '.mfa-key')); const ring = await readBackupKeys(backupKeyFile); backupEncryption = { required: true, configured: true, ...backupKeyInfo(ring) }; }
       catch (error) { backupEncryption = { required: true, configured: false, error: error instanceof Fault ? error.code : 'BACKUP_KEY_UNAVAILABLE' }; }
-      return { meta: { storage: storage.usage(), audit: { bytes: store.auditBytes, limit: store.auditLimit, protected: store.auditBytes + 65536 > store.auditLimit }, staleDays: (config.storage?.staleMs ?? 7 * 86400000) / 86400000, expiredBatch: storage.expired().length, cleanupAutomatic: Boolean(config.storage?.cleanupIntervalMs), backups, backupEncryption, backupCount: config.storage?.backupCount ?? 3, busy: maintenanceBusy } };
+      return { meta: { storage: storage.usage(), audit: { bytes: store.auditBytes, limit: store.auditLimit, protected: store.auditBytes + 65536 > store.auditLimit }, staleDays: (config.storage?.staleMs ?? 7 * 86400000) / 86400000, expiredBatch: storage.expired().length, cleanupAutomatic: Boolean(config.storage?.cleanupIntervalMs), backups, backupEncryption, scanning: scans.summary(), backupCount: config.storage?.backupCount ?? 3, busy: maintenanceBusy } };
     }
     if (op === 'maintenance.cleanup') {
       admin(c); need(m.confirm === '清理过期上传', 'INVALID_INPUT'); need(rate.allow('maintenance:' + u.id, 6), 'RATE_LIMITED');
@@ -345,13 +356,13 @@ export function createApp(config: Config) {
       admin(c); need(rate.allow('maintenance:' + u.id, 6), 'RATE_LIMITED'); need(!maintenanceBusy && !cleanupBusy, 'MAINTENANCE_BUSY');
       maintenanceBusy = true;
       try {
-        await Promise.allSettled([...activeDispatches]); authorized(c);
+        await Promise.allSettled([...activeDispatches]); await scans.idle(); authorized(c);
         await backupKeyLocation(backupKeyFile, config.root, backupRoot, resolve(config.mfaKeyFile ?? config.root + '.mfa-key'));
         audit(c, 'maintenance.backup.begin', 'allowed');
         const s = storage.usage();
         const result = await createBackup(store, backupRoot, { quota: config.storage?.backupQuota ?? 20 * 1024 ** 3, count: config.storage?.backupCount ?? 3, minFree: s.minFree, pending: s.pending, keyFile: backupKeyFile });
         audit(c, 'maintenance.backup', 'allowed', { backupId: result.id, bytes: result.bytes, encrypted: true, keyId: result.keyId }); return { meta: result };
-      } finally { maintenanceBusy = false; }
+      } finally { maintenanceBusy = false; scans.wake(); }
     }
     if (op === 'account.password') {
       need(rate.allow('reauth:' + u.id, 10) && authenticating < 4, 'RATE_LIMITED');
@@ -409,6 +420,7 @@ export function createApp(config: Config) {
     }
     if (op === 'deliveries.prepare' || op === 'deliveries.create') {
       const file = available(c, 'files', m.fileId);
+      scans.requireClean(file);
       need(rate.allow('delivery-lookup:' + u.id, 30), 'RATE_LIMITED');
       const name = text(m.recipient, 32);
       const recipient = /^[a-zA-Z0-9_-]{3,32}$/.test(name) ? store.get('SELECT id,name FROM users WHERE name=? AND disabled=0 AND id<>?', name, u.id) : undefined;
@@ -424,7 +436,7 @@ export function createApp(config: Config) {
         deliveryAudit(c, op, d); return { meta: { deliveryId: d.id, created: true } };
       });
     }
-    if (op === 'deliveries.received') return { meta: { deliveries: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id AS deliveryId,d.created AS sentAt,o.name AS sender FROM deliveries d JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId JOIN users o ON o.id=d.ownerId LEFT JOIN deletions x ON x.id=f.id AND x.kind='files' WHERE d.recipientId=? AND d.revoked=0 AND o.disabled=0 AND x.id IS NULL ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)) } };
+    if (op === 'deliveries.received') return { meta: { deliveries: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id AS deliveryId,d.created AS sentAt,o.name AS sender FROM deliveries d JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId JOIN users o ON o.id=d.ownerId LEFT JOIN deletions x ON x.id=f.id AND x.kind='files' WHERE d.recipientId=? AND d.revoked=0 AND o.disabled=0 AND x.id IS NULL ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)).map(scanFields) } };
     if (op === 'deliveries.sent') return { meta: { deliveries: store.all("SELECT d.id AS deliveryId,d.fileId,COALESCE(f.name,d.name) AS name,d.created AS sentAt,d.revoked,d.revokedAt,d.reason,r.name AS recipient FROM deliveries d JOIN users r ON r.id=d.recipientId LEFT JOIN files f ON f.id=d.fileId AND f.userId=d.ownerId WHERE d.ownerId=? ORDER BY d.created DESC,d.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)) } };
     if (op === 'deliveries.revoke') {
       const d = store.get('SELECT id FROM deliveries WHERE id=? AND ownerId=?', text(m.deliveryId, 80), u.id); need(d, 'NOT_FOUND');
@@ -433,14 +445,22 @@ export function createApp(config: Config) {
       await stopDownloads(job => job.deliveryId === d.id); return {};
     }
     if (op === 'storage.usage') return { meta: store.usage(u.id, config.quota ?? 1024 ** 3) };
-    if (op === 'files.list') return { meta: { files: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id IS NOT NULL AS deleting FROM files f LEFT JOIN deletions d ON d.id=f.id AND d.kind='files' WHERE f.userId=? ORDER BY f.created DESC,f.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)) } };
+    if (op === 'files.list') return { meta: { files: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id IS NOT NULL AS deleting FROM files f LEFT JOIN deletions d ON d.id=f.id AND d.kind='files' WHERE f.userId=? ORDER BY f.created DESC,f.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)).map(scanFields) } };
+    if (op === 'files.scan.status') { const { file } = accessible(c, m.fileId, m.deliveryId); return { meta: { fileId: file.id, scan: scans.status(file) } }; }
+    if (op === 'files.scan') {
+      const file = available(c, 'files', m.fileId);
+      need(rate.allow('scan-request:' + u.id, 30) && rate.allow('scan-file:' + file.id, 6), 'RATE_LIMITED');
+      store.transaction(() => { if (scans.enqueue(file)) audit(c, 'files.scan.request', 'allowed', { fileId: file.id }); });
+      await stopDownloads(job => downloads.get(file.id)?.has(job) ?? false, new Fault('FILE_SCAN_REQUIRED')); scans.wake();
+      return { meta: { fileId: file.id, scan: scans.status(file) } };
+    }
     if (op === 'transfers.list') return { meta: { transfers: store.all("SELECT t.id,t.name,t.size,t.sha256,t.offset,t.created,d.id IS NOT NULL AS deleting FROM transfers t LEFT JOIN deletions d ON d.id=t.id AND d.kind='transfers' WHERE t.userId=? ORDER BY t.created DESC LIMIT 16", u.id) } };
     if (op === 'files.rename' || op === 'files.delete' || op === 'upload.cancel') {
       need(rate.allow('file-mutation:' + u.id, 60), 'RATE_LIMITED');
       if (op === 'files.delete' || op === 'upload.cancel') return erase(c, op === 'files.delete' ? 'files' : 'transfers', op === 'files.delete' ? m.fileId : m.transferId);
       const file = available(c, 'files', m.fileId), name = filename(m.name); need(!locks.has(file.id), 'FILE_BUSY');
       store.transaction(() => { store.run('UPDATE files SET name=? WHERE id=? AND userId=?', name, file.id, u.id); audit(c, op, 'allowed', { fileId: file.id, oldName: file.name, name }); });
-      return { meta: { file: { id: file.id, name, size: file.size, sha256: file.sha256, created: file.created, deleting: 0 } } };
+      return { meta: { file: scanFields({ id: file.id, name, size: file.size, sha256: file.sha256, created: file.created, deleting: 0 }) } };
     }
     if (op === 'upload.init') {
       const name = filename(m.name);
@@ -464,7 +484,7 @@ export function createApp(config: Config) {
       } finally { locks.delete(transferId); }
     }
     if (['upload.chunk', 'upload.finish'].includes(op)) {
-      if (op === 'upload.finish') { const done = store.get('SELECT id,sha256 FROM files WHERE id=? AND userId=?', text(m.transferId, 80), u.id); if (done) { notDeleting('files', done.id); return { meta: { fileId: done.id, sha256: done.sha256 } }; } }
+      if (op === 'upload.finish') { const done = store.get('SELECT * FROM files WHERE id=? AND userId=?', text(m.transferId, 80), u.id); if (done) { notDeleting('files', done.id); return { meta: { fileId: done.id, sha256: done.sha256, scan: scans.status(done) } }; } }
       const t = available(c, 'transfers', m.transferId); need(!locks.has(t.id), 'TRANSFER_BUSY'); locks.add(t.id);
       const path = join(config.root, 'staging', t.id);
       try {
@@ -492,8 +512,8 @@ export function createApp(config: Config) {
           need((await stat(source)).size === t.size && await hashFile(source) === t.sha256, 'HASH_MISMATCH'); authorized(c);
           if (source !== final) await rename(path, final);
           authorized(c);
-          store.transaction(() => { store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', t.id, u.id, t.name, t.size, t.sha256, Date.now()); store.run('DELETE FROM transfers WHERE id=?', t.id); store.run('DELETE FROM transfer_activity WHERE id=?', t.id); audit(c, op, 'allowed', { fileId: t.id, size: t.size, sha256: t.sha256 }); });
-          return { meta: { fileId: t.id, sha256: t.sha256 } };
+          store.transaction(() => { store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', t.id, u.id, t.name, t.size, t.sha256, Date.now()); store.run('DELETE FROM transfers WHERE id=?', t.id); store.run('DELETE FROM transfer_activity WHERE id=?', t.id); scans.enqueue(t); audit(c, op, 'allowed', { fileId: t.id, size: t.size, sha256: t.sha256, scan: 'pending' }); });
+          scans.wake(); return { meta: { fileId: t.id, sha256: t.sha256, scan: scans.status(t) } };
         } finally { hashing--; }
       } finally { locks.delete(t.id); }
     }
@@ -537,7 +557,8 @@ export function createApp(config: Config) {
       const keyId = id(); store.transaction(() => { store.run('INSERT INTO keys VALUES(?,?,?,?,?)', keyId, u.id, JSON.stringify(jwk), text(m.label, 60), Date.now()); audit(c, op, 'allowed', { keyId }); }); return { meta: { keyId } };
     }
     if (op === 'events.list') {
-      const events = store.all('SELECT seq,event FROM audit ORDER BY seq DESC LIMIT 300').map(r => ({ seq: r.seq, ...JSON.parse(r.event) })).filter(r => u.role === 'admin' || r.user === u.name || ['deliveries.create', 'deliveries.revoke', 'deliveries.download'].includes(r.action) && (r.detail.ownerId === u.id || r.detail.recipientId === u.id)).slice(0, 24);
+      const events = store.all('SELECT seq,event FROM audit ORDER BY seq DESC LIMIT 300').map(r => ({ seq: r.seq, ...JSON.parse(r.event) })).filter(r => u.role === 'admin' || r.user === u.name || ['files.scan.begin', 'files.scan'].includes(r.action) && r.detail.ownerId === u.id || ['deliveries.create', 'deliveries.revoke', 'deliveries.download'].includes(r.action) && (r.detail.ownerId === u.id || r.detail.recipientId === u.id)).slice(0, 24);
+      while (Buffer.byteLength(JSON.stringify({ events })) > 12 * 1024) events.pop();
       return { meta: { events } };
     }
     if (op === 'audit.page') { admin(c); return { meta: { rows: store.all('SELECT * FROM audit WHERE seq>? ORDER BY seq LIMIT 8', integer(m.after ?? 0)), checkpoint: store.checkpoint() } }; }
@@ -600,5 +621,5 @@ export function createApp(config: Config) {
     }
   }, config.storage.cleanupIntervalMs) : undefined; cleanupTimer?.unref();
   if (store.auditBytes + 4096 < store.auditLimit) store.audit('system', 'server.start', 'allowed', { protocol: 'SFT/1' });
-  return { server, store, bw, storage, async close() { clearInterval(heartbeat); clearInterval(cleanupTimer); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
+  return { server, store, bw, storage, scans, async close() { clearInterval(heartbeat); clearInterval(cleanupTimer); for (const c of contexts) { c.abort.abort(); c.ws.terminate(); } await scans.close(); await new Promise<void>(r => wss.close(() => r())); await Promise.allSettled([...operations]); await new Promise<void>(r => server.close(() => r())); store.close(); } };
 }

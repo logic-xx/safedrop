@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { resolve, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { WebSocket } from 'ws';
-import { createApp, type Config } from '../server/app.ts';
+import { createTestApp as createApp, type Config } from './test-scanner.ts';
 import { Store, digest, verifyAudit } from '../server/store.ts';
 import { createBackup, verifyBackup, restoreBackup, type BackupAccess } from '../server/backup.ts';
 import { changeBackupKeys, readBackupKeys } from '../server/backup-keys.ts';

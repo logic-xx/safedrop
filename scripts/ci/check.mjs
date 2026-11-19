@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { resolve, join, dirname, sep } from 'node:path';
 import { tool } from './tool.mjs';
-import { auditPolicy, safeSourcePath, imagePolicy, secureNode24 } from './policy.mjs';
+import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy } from './policy.mjs';
 import { gatewayPolicy } from '../gateway-policy.mjs';
 const [mode, reference, imageSource = 'docker'] = process.argv.slice(2);
 const git = args => execFileSync('git', args, { encoding: 'utf8', windowsHide: true });
@@ -66,10 +66,11 @@ try {
     }
   } else if (mode === 'runtime-report') {
     const report = await json('reports/container-latest.json');
-    if(report.ok !== true || report.version !== 9 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.backup?.encrypted !== true || report.backupEncryption?.ok !== true || report.backupEncryption?.stableKeyRing !== true || report.backupEncryption?.rotation !== true || report.backupEncryption?.keyReload !== true || report.backupEncryption?.legacyCompatibility !== true || report.backupEncryption?.authenticationFailuresRejected !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
+    const scanning = scanRuntimePolicy(report);
+    if(report.ok !== true || report.version !== 10 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.backup?.encrypted !== true || report.backupEncryption?.ok !== true || report.backupEncryption?.stableKeyRing !== true || report.backupEncryption?.rotation !== true || report.backupEncryption?.keyReload !== true || report.backupEncryption?.legacyCompatibility !== true || report.backupEncryption?.authenticationFailuresRejected !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
     gatewayPolicy('go\t'+report.gateway.go+'\n'+Object.entries(report.gateway.modules??{}).map(([name,version])=>'dep\t'+name+'\t'+version).join('\n'));
     if(report.gateway.oldGoJosePresent!==false) throw Error('GATEWAY_LEGACY_DEPENDENCY_PRESENT');
-    await save('runtime-report',{ok:true,scope:process.env.GITHUB_ACTIONS === 'true' ? 'isolated CI containers; no user data volumes' : 'local containers; see original report for retained data scope',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,backupEncryption:report.backupEncryption,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
+    await save('runtime-report',{ok:true,scope:process.env.GITHUB_ACTIONS === 'true' ? 'isolated CI containers; no user data volumes' : 'local containers; see original report for retained data scope',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,backupEncryption:report.backupEncryption,scanning,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
     console.log('Isolated runtime, strict HTTPS/WSS, persistent data and backup checks: passed');
   } else if (mode === 'artifacts') {
     const executable = await tool('gitleaks'), snapshot = await mkdtemp(resolve('.local/ci-artifact-'));

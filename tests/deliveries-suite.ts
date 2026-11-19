@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { WebSocket } from 'ws';
-import { createApp } from '../server/app.ts';
+import { createTestApp as createApp, scanFixtureFile } from './test-scanner.ts';
 import { digest, verifyAudit } from '../server/store.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer, type Result } from './suite.ts';
@@ -27,6 +27,7 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     const owner = await login('owner'), reader = await login('reader'), stranger = await login('stranger'), admin = await login('admin');
     const bytes = randomBytes(CHUNK + 79), fileId = crypto.randomUUID(); writeFileSync(join(config.root, 'objects', fileId), bytes);
     app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', fileId, ids.owner, '交付资料.bin', bytes.length, digest(bytes), Date.now());
+    await scanFixtureFile(app, fileId);
     const send = async (recipient = 'reader', peer = owner) => String((await peer.rpc('deliveries.create', { fileId, recipient })).meta.deliveryId);
     return { config, ids, bytes, fileId, owner, reader, stranger, admin, connect, login, send, get app() { return app; },
       async restart() { await app.close(); app = createApp(config); await start(); },
@@ -204,7 +205,7 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     const snapshot = () => JSON.parse(execFileSync(process.execPath, [resolve('scripts/data-snapshot.mjs')], { env: { ...process.env, DATA_DIR: f.config.root }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     const before = snapshot(); await f.restart(); const after = snapshot();
     for (const [table, records] of Object.entries(before.tables)) for (const [id, hash] of Object.entries(records as Record<string, string>)) assert.equal(after.tables[table][id], hash);
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 5); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 6); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
   });
   return results;
 }

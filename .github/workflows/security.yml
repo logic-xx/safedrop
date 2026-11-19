@@ -95,9 +95,9 @@ jobs:
           retention-days: 14
 
   image-security:
-    name: Built application and gateway image vulnerabilities
+    name: Built application, gateway and scanner images
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,6 +131,9 @@ jobs:
       - name: Scan the gateway image
         if: always() && steps.runtime.outcome == 'success'
         run: npm run ci:image -- safedrop-gateway:verify
+      - name: Scan the actual patched scanner image
+        if: always() && steps.runtime.outcome == 'success'
+        run: npm run ci:image -- safedrop-scanner:verify
       - name: Check report credentials before upload
         id: artifacts
         if: always()

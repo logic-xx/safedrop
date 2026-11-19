@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { WebSocket } from 'ws';
-import { createApp } from '../server/app.ts';
+import { createTestApp as createApp } from './test-scanner.ts';
 import { CHUNK, MAX_META } from '../shared/protocol.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer } from './suite.ts';

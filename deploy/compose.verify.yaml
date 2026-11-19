@@ -5,6 +5,8 @@ services:
     environment:
       APP_ORIGIN: https://localhost:18443
       BACKUP_MAX_COUNT: "10"
+  scanner:
+    image: safedrop-scanner:verify
   gateway:
     image: safedrop-gateway:verify
     ports: !override ["127.0.0.1:18443:8443"]

@@ -28,7 +28,7 @@ const enter = async () => { const p = await connect(); return { p, first: await 
 try {
   const admin = (await enter()).p, setup = await admin.rpc('mfa.setup', { password }), secret = unbase32(setup.secret);
   const enabled = await admin.rpc('mfa.enable', { code: totp(secret, now), confirm: enableConfirmation }); assert.equal(enabled.recoveryCodes.length, 10);
-  assert.ok(existsSync(config.root + '.mfa-key')); assert.equal(app.store.get('PRAGMA user_version').user_version, 5);
+  assert.ok(existsSync(config.root + '.mfa-key')); assert.equal(app.store.get('PRAGMA user_version').user_version, 6);
   const pending = await enter(); assert.equal(pending.first.mfaRequired, true); await assert.rejects(pending.p.rpc('maintenance.status'), /AUTH_REQUIRED/);
   await assert.rejects(pending.p.rpc('auth.mfa', { challenge: pending.first.challenge, code: totp(secret, now) }), /MFA_INVALID/);
   now += 30000; await pending.p.rpc('auth.mfa', { challenge: pending.first.challenge, code: totp(secret, now) }); assert.equal((await pending.p.rpc('maintenance.status')).ok, true);
@@ -38,5 +38,5 @@ try {
   assert.equal((await recovery.p.rpc('maintenance.status')).ok, true);
   await app.close(); app = createApp(config); await start(); const restarted = await enter(); assert.equal(restarted.first.mfaRequired, true);
   now += 30000; await restarted.p.rpc('auth.mfa', { challenge: restarted.first.challenge, code: totp(unbase32(replacement.secret), now) }); assert.equal((await restarted.p.rpc('maintenance.status')).ok, true);
-  console.log(JSON.stringify({ ok: true, version: 1, node: process.version, scope: 'isolated temporary data in final runtime', databaseVersion: 5, checks: ['enable and encrypted key persistence', 'password alone cannot access business', 'TOTP replay denied and full login accepted', 'recovery session restricted until new authenticator verified', 'MFA still required and usable after process restart'], originalAccountsChanged: false, originalDataChanged: false }));
+  console.log(JSON.stringify({ ok: true, version: 1, node: process.version, scope: 'isolated temporary data in final runtime', databaseVersion: 6, checks: ['enable and encrypted key persistence', 'password alone cannot access business', 'TOTP replay denied and full login accepted', 'recovery session restricted until new authenticator verified', 'MFA still required and usable after process restart'], originalAccountsChanged: false, originalDataChanged: false }));
 } finally { await app.close(); }

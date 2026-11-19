@@ -6,6 +6,7 @@ import { runDeliverySuite } from '../tests/deliveries-suite.ts';
 import { runMaintenanceSuite } from '../tests/maintenance-suite.ts';
 import { runMfaSuite } from '../tests/mfa-suite.ts';
 import { runBackupEncryptionSuite } from '../tests/backup-encryption-suite.ts';
+import { runFileScanSuite } from '../tests/scans-suite.ts';
 const report = await runSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`));
 report.results.push(...await runAccountSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
 report.results.push(...await runFileSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
@@ -13,6 +14,7 @@ report.results.push(...await runDeliverySuite(r => console.log(`${r.ok ? 'PASS' 
 report.results.push(...await runMaintenanceSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
 report.results.push(...await runMfaSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
 report.results.push(...await runBackupEncryptionSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
+report.results.push(...await runFileScanSuite(r => console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.name} (${r.ms} ms)`)));
 report.passed = report.results.filter(r => r.ok).length;
 mkdirSync('reports', { recursive: true });
 writeFileSync('reports/latest.json', JSON.stringify(report, null, 2));

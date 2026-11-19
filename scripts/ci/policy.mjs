@@ -38,3 +38,11 @@ export function imagePolicy(report) {
   const blocked = findings.filter(v => high(v.severity));
   return { ok: blocked.length === 0, status: blocked.length ? 'failed' : 'passed', artifact: report.ArtifactName, imageId: report.Metadata?.ImageID ?? null, repoDigests: report.Metadata?.RepoDigests ?? [], findings, blocked: blocked.length };
 }
+export function scanRuntimePolicy(report) {
+  assert.equal(report.version,10,'SCANNING_CONTAINER_REPORT_V10_REQUIRED');
+  const scan=report.scanning;
+  assert.ok(scan && scan.databaseVersion===6 && secureNode24(scan.node) && /^ClamAV 1\.5\.5\//.test(scan.engine??''),'PATCHED_SCANNER_RUNTIME_REQUIRED');
+  for(const field of ['ok','malwareApi','encryptedArchiveRejected','recursionLimitRejected','unavailableRejected','legacyDefaultBlocked','expiryRejected','restart','encryptedBackupRestore']) assert.equal(scan[field],true,'REAL_SCANNER_CHECK_REQUIRED:'+field);
+  for(const field of ['originalAccountsChanged','originalDataChanged']) assert.equal(scan[field],false,'SCANNER_FIXTURE_ISOLATION_REQUIRED');
+  return scan;
+}

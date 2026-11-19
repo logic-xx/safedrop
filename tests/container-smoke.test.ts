@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createServer } from 'node:https';
-import { createApp } from '../server/app.ts';
+import { createTestApp as createApp } from './test-scanner.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { checkContainer } from './container-smoke.ts';
 import { changeBackupKeys } from '../server/backup-keys.ts';

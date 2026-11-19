@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, copyFileSync, exis
 import { join, resolve } from 'node:path';
 import { randomBytes, generateKeyPairSync, sign } from 'node:crypto';
 import { WebSocket } from 'ws';
-import { createApp, type Config } from '../server/app.ts';
+import { createTestApp as createApp, type Config } from './test-scanner.ts';
 import { Store, digest, verifyAudit } from '../server/store.ts';
 import { MfaGuard, unbase32, totp } from '../server/mfa.ts';
 import { verifyBackup, restoreBackup } from '../server/backup.ts';
@@ -188,7 +188,7 @@ export async function runMfaSuite(onResult?: (r: Result) => void) {
     const bytes = Buffer.from('legacy-mfa-migration'), sha = digest(bytes), transfer = (await f.admin.rpc('upload.init', { name: 'legacy.bin', size: bytes.length, sha256: sha })).meta.id;
     f.app.store.db.exec('DROP TABLE mfa_settings; DROP TABLE mfa_recovery; DROP TABLE mfa_sessions; DROP TABLE mfa_attempts; PRAGMA user_version=4;');
     const users = JSON.stringify(f.app.store.all('SELECT * FROM users')), transfers = JSON.stringify(f.app.store.all('SELECT * FROM transfers')), anchor = f.app.store.checkpoint();
-    await f.restart(); assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 5); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM users')), users); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM transfers')), transfers); assert.ok(verifyAudit(f.app.store.all('SELECT * FROM audit ORDER BY seq'), anchor).ok);
+    await f.restart(); assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 6); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM users')), users); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM transfers')), transfers); assert.ok(verifyAudit(f.app.store.all('SELECT * FROM audit ORDER BY seq'), anchor).ok);
     const admin = (await f.login()).p; assert.equal((await admin.rpc('mfa.status')).meta.enabled, false); assert.equal((await admin.rpc('upload.init', { transferId: transfer, name: 'legacy.bin', size: bytes.length, sha256: sha })).meta.offset, 0);
   });
   await run('MFA 升级证据：多个账号和全部恢复码逐条指纹保留，不互相覆盖', async f => {

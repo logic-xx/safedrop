@@ -6,7 +6,7 @@ import { randomBytes, generateKeyPairSync, sign } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
 import { WebSocket } from 'ws';
-import { createApp } from '../server/app.ts';
+import { createTestApp as createApp, scanFixtureFile } from './test-scanner.ts';
 import { Store, digest, passwordHash, verifyAudit } from '../server/store.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer, type Result } from './suite.ts';
@@ -159,6 +159,7 @@ export async function runAccountSuite(onResult?: (r: Result) => void) {
     const transferId = (await up.rpc('upload.init', { name: 'pending.bin', size: bytes.length, sha256: sha })).meta.id;
     const fileId = crypto.randomUUID(); writeFileSync(join(f.data, 'objects', fileId), bytes);
     f.app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', fileId, uid, 'owned.bin', bytes.length, sha, Date.now());
+    await scanFixtureFile(f.app, fileId);
     // Hold both operations in the real bandwidth wait; cancellation must beat the five-second reservation.
     f.app.bw.next.set(uid, performance.now() + 5000);
     let count = 0, started!: () => void; const waiting = new Promise<void>(r => started = r), take = f.app.bw.take.bind(f.app.bw);
@@ -181,6 +182,7 @@ export async function runAccountSuite(onResult?: (r: Result) => void) {
     const bytes = randomBytes(CHUNK), sha = digest(bytes), fileId = crypto.randomUUID();
     const transferId = (await up.rpc('upload.init', { name: 'waiting.bin', size: bytes.length, sha256: sha })).meta.id;
     writeFileSync(join(f.data, 'objects', fileId), bytes); f.app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', fileId, uid, 'existing.bin', bytes.length, sha, Date.now());
+    await scanFixtureFile(f.app, fileId);
     f.app.bw.next.set(uid, performance.now() + 5000);
     let count = 0, started!: () => void; const waiting = new Promise<void>(r => started = r), take = f.app.bw.take.bind(f.app.bw);
     f.app.bw.take = async (...args) => { if (++count === 2) started(); return take(...args); };
@@ -275,9 +277,11 @@ export async function runAccountSuite(onResult?: (r: Result) => void) {
       assert.equal(verifyAudit(app.store.all('SELECT * FROM audit ORDER BY seq'), { count: 1, head }).ok, true);
       app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening');
       const port = (app.server.address() as { port: number }).port, ws = new WebSocket(`wss://127.0.0.1:${port}/ws`, { ca, headers: { Origin: 'https://localhost' } }); await once(ws, 'open'); const p = new Peer(ws);
-      await p.rpc('auth.password', { name: 'legacy', password: pass }); assert.equal((await p.rpc('download.chunk', { fileId: 'legacy-file', offset: 0 })).payload.length, bytes.length);
+      await p.rpc('auth.password', { name: 'legacy', password: pass });
+      await assert.rejects(p.rpc('download.chunk', { fileId: 'legacy-file', offset: 0 }), /FILE_SCAN_REQUIRED/); await scanFixtureFile(app, 'legacy-file');
+      assert.equal((await p.rpc('download.chunk', { fileId: 'legacy-file', offset: 0 })).payload.length, bytes.length);
       await p.rpc('upload.chunk', { transferId: 'legacy-transfer', offset: 3 }, bytes.subarray(3)); assert.equal((await p.rpc('upload.finish', { transferId: 'legacy-transfer' })).meta.sha256, sha);
-      const other = new Store(legacyRoot); assert.equal(other.get('PRAGMA user_version')!.user_version, 5); assert.equal(other.get('SELECT COUNT(*) AS n FROM users')!.n, 1); other.close();
+      const other = new Store(legacyRoot); assert.equal(other.get('PRAGMA user_version')!.user_version, 6); assert.equal(other.get('SELECT COUNT(*) AS n FROM users')!.n, 1); other.close();
     } finally { await app.close(); }
   }, '真实旧表结构迁移后原口令可登录、原文件可下载、原偏移可续传；公钥及历史审计保留，重复打开不再迁移。');
   return results;

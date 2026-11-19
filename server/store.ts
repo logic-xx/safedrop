@@ -41,7 +41,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
     // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
     const version = this.get('PRAGMA user_version')!.user_version;
-    need(version <= 5, 'DATABASE_VERSION_UNSUPPORTED');
+    need(version <= 6, 'DATABASE_VERSION_UNSUPPORTED');
     if (version < 1) this.transaction(() => {
       this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
@@ -72,6 +72,12 @@ export class Store {
         CREATE TABLE IF NOT EXISTS mfa_sessions(sessionId TEXT PRIMARY KEY,userId TEXT NOT NULL,authVersion INTEGER NOT NULL,method TEXT NOT NULL CHECK(method IN ('totp','recovery')));
         CREATE TABLE IF NOT EXISTS mfa_attempts(userId TEXT PRIMARY KEY,failures INTEGER NOT NULL,windowStart INTEGER NOT NULL,blockedUntil INTEGER NOT NULL);
         PRAGMA user_version=5;`);
+    });
+    if (version < 6) this.transaction(() => {
+      // Missing rows mean unscanned; no legacy file or authorization is rewritten.
+      this.db.exec(`CREATE TABLE IF NOT EXISTS file_scans(fileId TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,sha256 TEXT NOT NULL,size INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','scanning','clean','quarantined','error')),generation TEXT NOT NULL,requested INTEGER NOT NULL,checked INTEGER NOT NULL DEFAULT 0,engine TEXT NOT NULL DEFAULT '',signature TEXT NOT NULL DEFAULT '',code TEXT NOT NULL DEFAULT '');
+        CREATE INDEX IF NOT EXISTS file_scans_queue ON file_scans(state,requested,fileId);
+        PRAGMA user_version=6;`);
     });
     this.auditBytes = this.get('SELECT COALESCE(SUM(length(CAST(event AS BLOB))+128),0) AS n FROM audit')!.n;
   }

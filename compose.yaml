@@ -5,6 +5,7 @@ services:
     image: safedrop:0.1.0
     environment:
       APP_ORIGIN: https://localhost:8443
+      CLAMD_HOST: scanner
     read_only: true
     user: "10001:10001"
     cap_drop: [ALL]
@@ -23,6 +24,31 @@ services:
       interval: 20s
       timeout: 5s
       retries: 3
+    restart: unless-stopped
+  scanner:
+    build:
+      context: .
+      dockerfile: deploy/scanner/Dockerfile
+    image: safedrop-scanner:0.1.0
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 4g
+    cpus: 1.5
+    init: true
+    tmpfs: ["/tmp:size=1536m,noexec,nosuid,uid=65532,gid=65532,mode=0700"]
+    volumes:
+      - scanner_data:/data
+    networks: [backend, signatures]
+    healthcheck:
+      test: [CMD, /nodejs/bin/node, /scanner/health.mjs]
+      interval: 20s
+      timeout: 5s
+      start_period: 300s
+      retries: 10
+    stop_grace_period: 30s
     restart: unless-stopped
   gateway:
     build:
@@ -47,7 +73,9 @@ services:
 networks:
   backend: {internal: true}
   edge: {}
+  signatures: {}
 volumes:
   app_data:
   caddy_data:
   caddy_config:
+  scanner_data:

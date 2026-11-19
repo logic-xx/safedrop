@@ -4,6 +4,8 @@ services:
     extends: {file: compose.yaml, service: app}
     environment:
       APP_ORIGIN: https://${DOMAIN:?Set DOMAIN to a controlled public domain}
+  scanner:
+    extends: {file: compose.yaml, service: scanner}
   gateway:
     build:
       context: .
@@ -31,7 +33,9 @@ services:
 networks:
   backend: {internal: true}
   edge:
+  signatures:
 volumes:
   app_data:
   caddy_data:
   caddy_config:
+  scanner_data:

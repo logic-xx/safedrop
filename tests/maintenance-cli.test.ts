@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { createApp } from '../server/app.ts';
+import { createTestApp as createApp } from './test-scanner.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { MfaGuard, totp } from '../server/mfa.ts';
 

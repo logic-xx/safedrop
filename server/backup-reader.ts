@@ -103,6 +103,12 @@ async function verifyReader(reader: Reader, anchor?: Checkpoint, temporaryRoot?:
       const entry = entries.get('staging/' + transfer.id) ?? entries.get('objects/' + transfer.id), deleting = db.prepare("SELECT id FROM deletions WHERE id=? AND kind='transfers'").get(transfer.id);
       need(deleting || entry && entry.size >= transfer.offset && entry.size <= transfer.size, 'BACKUP_INVALID');
     }
+    if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='file_scans'").get()) {
+      for (const scan of db.prepare('SELECT * FROM file_scans').all() as Row[]) {
+        const file = db.prepare('SELECT * FROM files WHERE id=?').get(scan.fileId) as Row | undefined;
+        need(file && scan.sha256 === file.sha256 && scan.size === file.size && ['pending','scanning','clean','quarantined','error'].includes(scan.state), 'BACKUP_INVALID');
+      }
+    }
     return { ...m, encrypted: reader.encrypted, ...(reader.keyId ? { keyId: reader.keyId } : {}), storedBytes: reader.storedBytes };
   } finally {
     db?.close();
