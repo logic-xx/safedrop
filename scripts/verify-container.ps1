@@ -55,6 +55,20 @@ try {
     $privateDir = Join-Path $projectRoot '.local/container-check'
     New-Item -ItemType Directory -Path $privateDir -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $projectRoot 'reports') -Force | Out-Null
+    # Prepare a dedicated context containing only the pinned public vendor archive.
+    # A verified existing local package is reused; downloads occur on the host with resume.
+    Write-Host 'Preparing the pinned scanner package; a verified local cache is reused when available ...'
+    $vendorInputJson = & node 'scripts/prepare-scanner-vendor.mjs'
+    if ($LASTEXITCODE -ne 0) { throw 'Scanner vendor input preparation failed. Existing containers and data remain unchanged.' }
+    $vendorInput = $vendorInputJson | ConvertFrom-Json
+    Assert-Condition ([bool]$vendorInput.ok) 'The scanner vendor package was not verified.'
+    $composeBuildArgs = $composeArgs + @('--file', [string]$vendorInput.override)
+    $buildModel = Invoke-DockerChecked @composeBuildArgs config --format json | ConvertFrom-Json
+    Assert-Condition ($buildModel.services.scanner.build.args.REQUIRE_LOCAL_VENDOR -eq '1') 'Verification must require the local verified package input.'
+    $buildContexts = @($buildModel.services.scanner.build.additional_contexts.PSObject.Properties)
+    Assert-Condition ($buildContexts.Count -eq 1 -and $buildContexts[0].Name -eq 'vendor_package' -and [IO.Path]::GetFullPath([string]$buildContexts[0].Value) -eq [IO.Path]::GetFullPath([string]$vendorInput.context)) 'Unexpected scanner build context.'
+    Write-Host "PASS verified scanner vendor cache ($($vendorInput.bytes) bytes, $($vendorInput.from)); build will not redownload it."
+    $scannerBuildInput = [ordered]@{ verified = $true; bytes = $vendorInput.bytes; sha256 = $vendorInput.sha256; source = $vendorInput.from; localContextRequired = $true }
     foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-scanner-provenance.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
@@ -80,7 +94,7 @@ try {
     Write-Host 'Building and starting isolated project safedrop-check on https://localhost:18443 ...'
     # Mounted Caddyfile changes require a new process even if its path is stable.
     # Recreating these verification containers preserves their named data volumes.
-    Invoke-DockerChecked @composeArgs up --build --force-recreate --detach --wait --wait-timeout 600
+    Invoke-DockerChecked @composeBuildArgs up --build --force-recreate --detach --wait --wait-timeout 600
     $existingData = [ordered]@{ checked = $false; records = 0 }
     if ($null -ne $existingSnapshot) {
         $snapshotArgs = $composeArgs + @('exec', '--no-TTY', 'app', 'node', '--input-type=module')
@@ -232,7 +246,7 @@ try {
     Assert-Condition ((Get-FileHash -LiteralPath $hostBackupKeyAfter -Algorithm SHA256).Hash -eq $backupKeyHash) 'The independent backup key file changed after restart.'
     $backupResult | Add-Member -NotePropertyName stableKeyRing -NotePropertyValue $true
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-backup.json'), ($backupResult | ConvertTo-Json -Depth 5), $utf8)
-    $summary = [ordered]@{ version = 10; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance }
+    $summary = [ordered]@{ version = 10; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance; scannerBuildInput = $scannerBuildInput }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

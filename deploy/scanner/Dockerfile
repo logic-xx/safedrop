@@ -1,8 +1,18 @@
+FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS vendor_download
+ARG REQUIRE_LOCAL_VENDOR=0
+COPY deploy/scanner/fetch-vendor.mjs deploy/scanner/vendor-artifact.mjs /
+RUN test "$REQUIRE_LOCAL_VENDOR" = 0 && node /fetch-vendor.mjs
+
+# A named context of this name replaces only this public package input.
+FROM scratch AS vendor_package
+COPY --from=vendor_download /vendor.deb /vendor.deb
+
 FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS vendor
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
-COPY deploy/scanner/fetch-vendor.mjs /fetch-vendor.mjs
-RUN node /fetch-vendor.mjs && dpkg-deb -x /vendor.deb /vendor \
+COPY deploy/scanner/fetch-vendor.mjs deploy/scanner/vendor-artifact.mjs /
+COPY --from=vendor_package /vendor.deb /vendor.deb
+RUN node /fetch-vendor.mjs --verify /vendor.deb && dpkg-deb -x /vendor.deb /vendor \
     && mkdir -p /runtime/bin /runtime/sbin /runtime/lib /runtime/etc/certs /runtime-data /metadata \
     && cp /vendor/usr/local/bin/freshclam /runtime/bin/ \
     && cp /vendor/usr/local/sbin/clamd /runtime/sbin/ \
