@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 export const high = severity => ['high', 'critical', 'HIGH', 'CRITICAL'].includes(severity);
 export function secureNode24(version) {
   const match = /^v?24\.(\d+)\.(\d+)$/.exec(version ?? '');
@@ -39,7 +40,7 @@ export function imagePolicy(report) {
   return { ok: blocked.length === 0, status: blocked.length ? 'failed' : 'passed', artifact: report.ArtifactName, imageId: report.Metadata?.ImageID ?? null, repoDigests: report.Metadata?.RepoDigests ?? [], findings, blocked: blocked.length };
 }
 export function scanRuntimePolicy(report) {
-  assert.equal(report.version,11,'SCANNING_CONTAINER_REPORT_V11_REQUIRED');
+  assert.equal(report.version,12,'SCANNING_CONTAINER_REPORT_V12_REQUIRED');
   const scan=report.scanning;
   assert.ok(scan && scan.databaseVersion===7 && secureNode24(scan.node) && /^ClamAV 1\.5\.5\//.test(scan.engine??''),'PATCHED_SCANNER_RUNTIME_REQUIRED');
   for(const field of ['ok','malwareApi','encryptedArchiveRejected','recursionLimitRejected','unavailableRejected','legacyDefaultBlocked','expiryRejected','restart','encryptedBackupRestore']) assert.equal(scan[field],true,'REAL_SCANNER_CHECK_REQUIRED:'+field);
@@ -47,10 +48,39 @@ export function scanRuntimePolicy(report) {
   return scan;
 }
 export function expiryRuntimePolicy(report) {
-  assert.equal(report.version,11,'DELIVERY_EXPIRY_CONTAINER_REPORT_V11_REQUIRED');
+  assert.equal(report.version,12,'DELIVERY_EXPIRY_CONTAINER_REPORT_V12_REQUIRED');
   const expiry=report.deliveryExpiry;
   assert.ok(expiry && expiry.platform==='linux' && expiry.databaseVersion===7 && secureNode24(expiry.node),'DELIVERY_EXPIRY_FINAL_LINUX_RUNTIME_REQUIRED');
   for(const field of ['ok','realScanner','strictDeadline','waitCancelled','restart','legacy','resend','encryptedBackupRestore']) assert.equal(expiry[field],true,'DELIVERY_EXPIRY_CHECK_REQUIRED:'+field);
   for(const field of ['originalAccountsChanged','originalDataChanged']) assert.equal(expiry[field],false,'DELIVERY_EXPIRY_FIXTURE_ISOLATION_REQUIRED');
   return expiry;
+}
+
+export function compositionPolicy(report, manifestBytes) {
+  assert.equal(report.version,12,'COMPOSITION_CONTAINER_REPORT_V12_REQUIRED');
+  const manifest=JSON.parse(manifestBytes), manifestSha256=createHash('sha256').update(manifestBytes).digest('hex');
+  for (const service of ['app','scanner']) {
+    const proof=report.runtimeComposition?.[service];
+    assert.ok(proof && proof.version===1 && proof.ok===true && proof.platform==='linux' && proof.architecture==='x64', 'FINAL_RUNTIME_COMPOSITION_REQUIRED:'+service);
+    assert.equal(proof.node,manifest.nodeVersion);
+    assert.equal(proof.manifestSha256,manifestSha256,'RUNTIME_MANIFEST_MISMATCH');
+    for (const field of ['nodeImage','baseImage']) assert.equal(proof[field],manifest[field]);
+    assert.equal(proof.verifiedFiles,manifest.files.length);
+    assert.equal(proof.verifiedMetadata,manifest.metadata.length);
+    assert.equal(proof.sharedOpenSSL,false);
+    assert.equal(proof.quic,false);
+    assert.equal(proof.noSystemOpenSSL,true);
+    assert.equal(typeof proof.openssl,'string');
+    assert.ok(/^sha256:[a-f0-9]{64}$/.test(proof.imageId??''),'RUNTIME_IMAGE_ID_REQUIRED');
+  }
+  assert.equal(report.runtimeComposition.scanner.imageId,report.scannerProvenance?.imageId,'SCANNER_COMPOSITION_IMAGE_MISMATCH');
+  for (const phase of ['before','after']) assert.equal(report[phase]?.eventsQuery,true,'REAL_EVENTS_QUERY_REQUIRED:'+phase);
+  return report.runtimeComposition;
+}
+
+export function runtimeImagePolicy(report, manifestBytes, reference, imageId) {
+  const service=reference==='safedrop:verify'?'app':reference==='safedrop-scanner:verify'?'scanner':null;
+  assert.ok(service,'KNOWN_RUNTIME_IMAGE_REQUIRED');
+  const proof=compositionPolicy(report,manifestBytes);
+  assert.equal(imageId,proof[service].imageId,'SCANNED_RUNTIME_IMAGE_MISMATCH');
 }

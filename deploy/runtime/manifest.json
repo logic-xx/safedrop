@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "architecture": "x64",
+  "nodeVersion": "v24.22.3",
+  "nodeImage": "gcr.io/distroless/nodejs24-debian13:nonroot@sha256:6abfcb367ebc291572c774c1592a986be2ab26a2486f73093401327495a5962a",
+  "baseImage": "gcr.io/distroless/base-nossl-debian13:nonroot@sha256:89815d620ac01d8de13cdaf04d19ed874447ca2296d4985b14b818f6e5e47854",
+  "files": [
+    {
+      "path": "/nodejs/bin/node",
+      "sha256": "a7ec1b37e6ff9d187e4198c5b6df9a4eb1c74dd31804fb3bac55cc4ceca1ac01"
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33",
+      "sha256": "972bb2a18b71140dab0240f8a1f68ab3fb1d56bcd4c4f824a91b70888faf5a00"
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+      "sha256": "30c61ab012a4241bed033725a09b61f5fdd3bb7df95ee852d0b096520524c7af"
+    },
+    {
+      "path": "/nodejs/LICENSE",
+      "sha256": "5888dbb9a1d2b18f2c3e6c5f6af1b39de658372b402a0577b002777f14c62ace"
+    }
+  ],
+  "metadata": [
+    {
+      "path": "usr/share/doc/gcc-14-base/copyright",
+      "sha256": "20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+    },
+    {
+      "path": "var/lib/dpkg/status.d/gcc-14-base",
+      "sha256": "3ab3a11930c188172cc07ca122c7646b8d2c832e1403e37f993c53ceb838df28",
+      "package": "gcc-14-base",
+      "version": "14.2.0-19"
+    },
+    {
+      "path": "var/lib/dpkg/status.d/libstdc++6",
+      "sha256": "b11c92c5307bf79ac50b489ee7bff067417b6e8b33d6d0c99da897d37e004c19",
+      "package": "libstdc++6",
+      "version": "14.2.0-19"
+    },
+    {
+      "path": "var/lib/dpkg/status.d/libgcc-s1",
+      "sha256": "4ba5fe45998229ab1aefccdec602b925977e53cc97bbb28fc12412ac165459fc",
+      "package": "libgcc-s1",
+      "version": "14.2.0-19"
+    }
+  ]
+}

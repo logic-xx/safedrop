@@ -69,7 +69,7 @@ try {
     Assert-Condition ($buildContexts.Count -eq 1 -and $buildContexts[0].Name -eq 'vendor_package' -and [IO.Path]::GetFullPath([string]$buildContexts[0].Value) -eq [IO.Path]::GetFullPath([string]$vendorInput.context)) 'Unexpected scanner build context.'
     Write-Host "PASS verified scanner vendor cache ($($vendorInput.bytes) bytes, $($vendorInput.from)); build will not redownload it."
     $scannerBuildInput = [ordered]@{ verified = $true; bytes = $vendorInput.bytes; sha256 = $vendorInput.sha256; source = $vendorInput.from; localContextRequired = $true }
-    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-scanner-provenance.json', 'container-delivery-expiry.json', 'container-latest.json')) {
+    foreach ($reportName in @('container-seed.json', 'container-resume.json', 'container-profile.json', 'container-runtime.json', 'container-composition.json', 'container-mfa.json', 'container-gateway.json', 'container-backup.json', 'container-scan.json', 'container-scanner-provenance.json', 'container-delivery-expiry.json', 'container-latest.json')) {
         $reportFile = Join-Path $projectRoot "reports/$reportName"
         if (Test-Path -LiteralPath $reportFile) { Remove-Item -LiteralPath $reportFile }
     }
@@ -144,6 +144,16 @@ try {
     $appInfo = @(Invoke-DockerChecked inspect $appId | ConvertFrom-Json)[0]
     $gatewayInfo = @(Invoke-DockerChecked inspect $gatewayId | ConvertFrom-Json)[0]
     $scannerInfo = @(Invoke-DockerChecked inspect $scannerId | ConvertFrom-Json)[0]
+    # Verify the actual final files and inventory in both running containers.
+    # This is physical composition, not a VEX or an ignored vulnerability.
+    $compositionApp = Invoke-DockerChecked @composeArgs exec --no-TTY app /nodejs/bin/node /runtime/verify.mjs | ConvertFrom-Json
+    $compositionScanner = Invoke-DockerChecked @composeArgs exec --no-TTY scanner /nodejs/bin/node /runtime/verify.mjs | ConvertFrom-Json
+    Assert-Condition ([bool]$compositionApp.ok -and [bool]$compositionScanner.ok) 'Final runtime composition verification failed.'
+    $compositionApp | Add-Member -NotePropertyName imageId -NotePropertyValue $appInfo.Image
+    $compositionScanner | Add-Member -NotePropertyName imageId -NotePropertyValue $scannerInfo.Image
+    $runtimeComposition = [ordered]@{ app = $compositionApp; scanner = $compositionScanner }
+    [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-composition.json'), ($runtimeComposition | ConvertTo-Json -Depth 5), $utf8)
+    Write-Host 'PASS exact Node/C++ files and retained inventory; no system OpenSSL; Node QUIC disabled in both final runtimes.'
     # Bind the upstream fix assessment to every actual vendor binary/library and this image.
     $scannerProofSource = Get-Content -LiteralPath 'scripts/scanner-provenance.mjs' -Raw -Encoding UTF8
     $scannerProofArgs = $composeArgs + @('exec', '--no-TTY', 'scanner', '/nodejs/bin/node', '--input-type=module')
@@ -251,7 +261,7 @@ try {
     Assert-Condition ((Get-FileHash -LiteralPath $hostBackupKeyAfter -Algorithm SHA256).Hash -eq $backupKeyHash) 'The independent backup key file changed after restart.'
     $backupResult | Add-Member -NotePropertyName stableKeyRing -NotePropertyValue $true
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-backup.json'), ($backupResult | ConvertTo-Json -Depth 5), $utf8)
-    $summary = [ordered]@{ version = 11; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance; scannerBuildInput = $scannerBuildInput; deliveryExpiry = $expiryResult }
+    $summary = [ordered]@{ version = 12; created = [DateTime]::UtcNow.ToString('o'); ok = $true; project = 'safedrop-check'; origin = 'https://localhost:18443'; existingData = $existingData; upgradeIdentity = $upgradeIdentity; gateway = $gatewayResult; profile = $profile; before = (Get-Content -LiteralPath 'reports/container-seed.json' -Raw -Encoding UTF8 | ConvertFrom-Json); after = (Get-Content -LiteralPath 'reports/container-resume.json' -Raw -Encoding UTF8 | ConvertFrom-Json); stableAccounts = $true; stableCA = $true; backup = [ordered]@{ verified = $true; isolatedRestore = $true; independentCheckpoint = $true; encrypted = $true }; mfa = $mfaResult; backupEncryption = $backupResult; scanning = $scanResult; scannerProvenance = $scannerProvenance; scannerBuildInput = $scannerBuildInput; deliveryExpiry = $expiryResult; runtimeComposition = $runtimeComposition }
     [IO.File]::WriteAllText((Join-Path $projectRoot 'reports/container-latest.json'), ($summary | ConvertTo-Json -Depth 8), $utf8)
     Invoke-DockerChecked @composeArgs ps
     Write-Host 'PASS container verification. Report: reports/container-latest.json'

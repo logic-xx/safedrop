@@ -24,7 +24,18 @@ RUN node /fetch-vendor.mjs --verify /vendor.deb && dpkg-deb -x /vendor.deb /vend
 # Only signed signature data is copied from this image, never its older engine.
 FROM clamav/clamav:1.5.4-debian13-slim@sha256:6982509b9e1415bf23cb49d0c55872fdd57fd2b92be33fa26d487da42d322076 AS signatures
 
-FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:6abfcb367ebc291572c774c1592a986be2ab26a2486f73093401327495a5962a
+FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:6abfcb367ebc291572c774c1592a986be2ab26a2486f73093401327495a5962a AS node_runtime
+
+# Exact official Node/C++ files; ClamAV also needs no system OpenSSL.
+FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:89815d620ac01d8de13cdaf04d19ed874447ca2296d4985b14b818f6e5e47854
+COPY --from=node_runtime /nodejs /nodejs
+COPY --from=node_runtime /usr/lib/x86_64-linux-gnu/libstdc++.so.6* /usr/lib/x86_64-linux-gnu/
+COPY --from=node_runtime /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=node_runtime /var/lib/dpkg/status.d/libstdc++6 /var/lib/dpkg/status.d/libstdc++6
+COPY --from=node_runtime /var/lib/dpkg/status.d/libgcc-s1 /var/lib/dpkg/status.d/libgcc-s1
+COPY --from=node_runtime /var/lib/dpkg/status.d/gcc-14-base /var/lib/dpkg/status.d/gcc-14-base
+COPY --from=node_runtime /usr/share/doc/gcc-14-base /usr/share/doc/gcc-14-base
+COPY deploy/runtime/ /runtime/
 ENV TZ=Etc/UTC LD_LIBRARY_PATH=/usr/local/lib NODE_ENV=production
 WORKDIR /scanner
 COPY --from=vendor /runtime /usr/local
@@ -35,5 +46,7 @@ COPY --from=signatures --chown=65532:65532 /var/lib/clamav /seed
 COPY deploy/scanner/clamd.conf deploy/scanner/freshclam.conf deploy/scanner/run.mjs deploy/scanner/health.mjs ./
 COPY deploy/scanner/vendor-manifest.json ./
 USER 65532:65532
+RUN ["/nodejs/bin/node", "/runtime/verify.mjs"]
 EXPOSE 3310
+ENTRYPOINT ["/nodejs/bin/node"]
 CMD ["/scanner/run.mjs"]

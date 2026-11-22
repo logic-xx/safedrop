@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { resolve, join, dirname, sep } from 'node:path';
 import { tool } from './tool.mjs';
-import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy, expiryRuntimePolicy } from './policy.mjs';
+import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy, expiryRuntimePolicy, compositionPolicy, runtimeImagePolicy } from './policy.mjs';
 import { gatewayPolicy } from '../gateway-policy.mjs';
 import { scannerAssessment } from './scanner-assessment.mjs';
 import { VENDOR } from '../../deploy/scanner/vendor-artifact.mjs';
@@ -69,11 +69,12 @@ try {
   } else if (mode === 'runtime-report') {
     const report = await json('reports/container-latest.json');
     const scanning = scanRuntimePolicy(report); const deliveryExpiry = expiryRuntimePolicy(report);
+    const runtimeComposition = compositionPolicy(report,await readFile('deploy/runtime/manifest.json'));
     if(report.scannerBuildInput?.verified!==true||report.scannerBuildInput?.localContextRequired!==true||report.scannerBuildInput?.sha256!==VENDOR.sha256||report.scannerBuildInput?.bytes!==VENDOR.bytes)throw Error('VERIFIED_LOCAL_VENDOR_BUILD_INPUT_REQUIRED');
-    if(report.ok !== true || report.version !== 11 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.backup?.encrypted !== true || report.backupEncryption?.ok !== true || report.backupEncryption?.stableKeyRing !== true || report.backupEncryption?.rotation !== true || report.backupEncryption?.keyReload !== true || report.backupEncryption?.legacyCompatibility !== true || report.backupEncryption?.authenticationFailuresRejected !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || report.scannerProvenance?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
+    if(report.ok !== true || report.version !== 12 || report.gateway?.ok !== true || report.mfa?.ok !== true || report.stableAccounts !== true || report.stableCA !== true || report.backup?.verified !== true || report.backup?.isolatedRestore !== true || report.backup?.independentCheckpoint !== true || report.backup?.encrypted !== true || report.backupEncryption?.ok !== true || report.backupEncryption?.stableKeyRing !== true || report.backupEncryption?.rotation !== true || report.backupEncryption?.keyReload !== true || report.backupEncryption?.legacyCompatibility !== true || report.backupEncryption?.authenticationFailuresRejected !== true || report.before?.ok !== true || report.after?.ok !== true || report.profile?.ok !== true || report.scannerProvenance?.ok !== true || !secureNode24(report.mfa?.node)) throw Error('RUNTIME_CONTAINER_VERIFICATION_REQUIRED');
     gatewayPolicy('go\t'+report.gateway.go+'\n'+Object.entries(report.gateway.modules??{}).map(([name,version])=>'dep\t'+name+'\t'+version).join('\n'));
     if(report.gateway.oldGoJosePresent!==false) throw Error('GATEWAY_LEGACY_DEPENDENCY_PRESENT');
-    await save('runtime-report',{ok:true,scope:process.env.GITHUB_ACTIONS === 'true' ? 'isolated CI containers; no user data volumes' : 'local containers; see original report for retained data scope',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,backupEncryption:report.backupEncryption,scanning,scannerProvenance:report.scannerProvenance,scannerBuildInput:report.scannerBuildInput,deliveryExpiry,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
+    await save('runtime-report',{ok:true,scope:process.env.GITHUB_ACTIONS === 'true' ? 'isolated CI containers; no user data volumes' : 'local containers; see original report for retained data scope',containerReportCreated:report.created,node:report.mfa.node,stableAccounts:true,stableCA:true,backup:report.backup,mfa:report.mfa,gateway:report.gateway,backupEncryption:report.backupEncryption,scanning,scannerProvenance:report.scannerProvenance,scannerBuildInput:report.scannerBuildInput,deliveryExpiry,runtimeComposition,upgradeIdentity:report.upgradeIdentity,profileChecks:report.profile.checks.length});
     console.log('Isolated runtime, strict HTTPS/WSS, persistent data and backup checks: passed');
   } else if (mode === 'artifacts') {
     const executable = await tool('gitleaks'), snapshot = await mkdtemp(resolve('.local/ci-artifact-'));
@@ -98,7 +99,7 @@ try {
     }
   } else if (mode === 'scanner-test') {
     const executable = await tool('gitleaks');
-    const result = run(process.execPath, ['--test','tests/ci-policy.test.mjs','tests/scanner-assessment.test.mjs','tests/scanner-vendor.test.mjs'], 60000, { ...process.env, CI_GITLEAKS: executable });
+    const result = run(process.execPath, ['--test','tests/ci-policy.test.mjs','tests/runtime-composition.test.mjs','tests/scanner-assessment.test.mjs','tests/scanner-vendor.test.mjs'], 60000, { ...process.env, CI_GITLEAKS: executable });
     const ok = !result.error && result.status === 0; await save('scanner-test', { ok, scope: 'policy negatives and real synthetic-token detection/redaction' });
     if (!ok) throw Error('CI_SCANNER_SELF_TEST_FAILED'); console.log('Policy and real scanner self-test: passed');
   } else if (mode === 'workflow') {
@@ -122,6 +123,11 @@ try {
       throw Error('TRIVY_SCAN_FAILED:SEE_PRIVATE_LOCAL_DIAGNOSTICS');
     }
     const raw = await json(path);let policy = imagePolicy(raw);
+    if(['safedrop:verify','safedrop-scanner:verify'].includes(reference)){
+      if(imageSource!=='docker')throw Error('ACTUAL_RUNTIME_IMAGE_REQUIRED');
+      const runtime=await json('reports/container-latest.json');
+      runtimeImagePolicy(runtime,await readFile('deploy/runtime/manifest.json'),reference,raw.Metadata?.ImageID);
+    }
     if(reference==='safedrop-scanner:verify'){
       if(imageSource!=='docker')throw Error('ACTUAL_SCANNER_IMAGE_REQUIRED');
       const runtime=await json('reports/container-latest.json');scanRuntimePolicy(runtime);expiryRuntimePolicy(runtime);

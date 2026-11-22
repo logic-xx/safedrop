@@ -4,22 +4,42 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { join, resolve, sep } from 'node:path';
-import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy, expiryRuntimePolicy } from '../scripts/ci/policy.mjs';
+import { auditPolicy, safeSourcePath, imagePolicy, secureNode24, scanRuntimePolicy, expiryRuntimePolicy, compositionPolicy, runtimeImagePolicy } from '../scripts/ci/policy.mjs';
 test('CI runtime evidence requires a security-patched supported Node 24 version',()=>{
   for(const version of ['v24.14.0','v24.22.0','v24.22.2','v25.0.0','v26.0.0','v24.22.3-rc.1','']) assert.equal(secureNode24(version),false,version);
   for(const version of ['v24.22.3','24.22.4','v24.23.0']) assert.equal(secureNode24(version),true,version);
 });
 test('Scanner container evidence rejects a host-only probe, old engine or incomplete isolation',()=>{
   const scanning={node:'v24.22.3',engine:'ClamAV 1.5.5/123/date',databaseVersion:7,ok:true,malwareApi:true,encryptedArchiveRejected:true,recursionLimitRejected:true,unavailableRejected:true,legacyDefaultBlocked:true,expiryRejected:true,restart:true,encryptedBackupRestore:true,originalAccountsChanged:false,originalDataChanged:false};
-  const report={version:11,scanning};assert.equal(scanRuntimePolicy(report),scanning);
-  for(const patch of [{malwareApi:false},{engine:'ClamAV 1.5.4/123/date'},{originalDataChanged:true},{encryptedArchiveRejected:undefined}])assert.throws(()=>scanRuntimePolicy({version:11,scanning:{...scanning,...patch}}));
-  assert.throws(()=>scanRuntimePolicy({version:9,scanning}));assert.throws(()=>scanRuntimePolicy({version:11}));
+  const report={version:12,scanning};assert.equal(scanRuntimePolicy(report),scanning);
+  for(const patch of [{malwareApi:false},{engine:'ClamAV 1.5.4/123/date'},{originalDataChanged:true},{encryptedArchiveRejected:undefined}])assert.throws(()=>scanRuntimePolicy({version:12,scanning:{...scanning,...patch}}));
+  assert.throws(()=>scanRuntimePolicy({version:11,scanning}));assert.throws(()=>scanRuntimePolicy({version:12}));
 });
 test('Expiry runtime evidence rejects missing, host-only, partial or data-changing checks',()=>{
   const deliveryExpiry={node:'v24.22.3',platform:'linux',databaseVersion:7,ok:true,realScanner:true,strictDeadline:true,waitCancelled:true,restart:true,legacy:true,resend:true,encryptedBackupRestore:true,originalAccountsChanged:false,originalDataChanged:false};
-  assert.equal(expiryRuntimePolicy({version:11,deliveryExpiry}),deliveryExpiry);
-  assert.throws(()=>expiryRuntimePolicy({version:10,deliveryExpiry}));assert.throws(()=>expiryRuntimePolicy({version:11}));
-  for(const patch of [{platform:'win32'},{databaseVersion:6},{realScanner:false},{waitCancelled:false},{legacy:false},{encryptedBackupRestore:false},{originalDataChanged:true},{node:'v24.14.0'}])assert.throws(()=>expiryRuntimePolicy({version:11,deliveryExpiry:{...deliveryExpiry,...patch}}));
+  assert.equal(expiryRuntimePolicy({version:12,deliveryExpiry}),deliveryExpiry);
+  assert.throws(()=>expiryRuntimePolicy({version:11,deliveryExpiry}));assert.throws(()=>expiryRuntimePolicy({version:12}));
+  for(const patch of [{platform:'win32'},{databaseVersion:6},{realScanner:false},{waitCancelled:false},{legacy:false},{encryptedBackupRestore:false},{originalDataChanged:true},{node:'v24.14.0'}])assert.throws(()=>expiryRuntimePolicy({version:12,deliveryExpiry:{...deliveryExpiry,...patch}}));
+});
+test('Runtime composition binds both final images to exact files, inventory and scoped events before/after restart', async()=>{
+  const {createHash}=await import('node:crypto');
+  const bytes=readFileSync('deploy/runtime/manifest.json'),m=JSON.parse(bytes),imageId='sha256:'+'b'.repeat(64);
+  const proof={version:1,ok:true,platform:'linux',architecture:'x64',node:m.nodeVersion,openssl:'3.5.9',sharedOpenSSL:false,quic:false,noSystemOpenSSL:true,manifestSha256:createHash('sha256').update(bytes).digest('hex'),nodeImage:m.nodeImage,baseImage:m.baseImage,verifiedFiles:m.files.length,verifiedMetadata:m.metadata.length,imageId};
+  const report={version:12,runtimeComposition:{app:proof,scanner:proof},scannerProvenance:{imageId},before:{eventsQuery:true},after:{eventsQuery:true}};
+  assert.equal(compositionPolicy(report,bytes),report.runtimeComposition);
+  for(const service of ['app','scanner']) for(const patch of [{ok:false},{platform:'win32'},{architecture:'arm64'},{node:'v24.14.0'},{manifestSha256:'0'.repeat(64)},{baseImage:'other'},{verifiedMetadata:0},{noSystemOpenSSL:false},{sharedOpenSSL:true},{quic:true},{imageId:null}]) {
+    assert.throws(()=>compositionPolicy({...report,runtimeComposition:{...report.runtimeComposition,[service]:{...proof,...patch}}},bytes));
+  }
+  assert.throws(()=>compositionPolicy({...report,version:11},bytes));
+  assert.throws(()=>compositionPolicy({...report,scannerProvenance:{imageId:'sha256:'+'c'.repeat(64)}},bytes));
+  assert.throws(()=>compositionPolicy({...report,after:{eventsQuery:false}},bytes));
+  assert.throws(()=>compositionPolicy({...report,before:{}},bytes));
+  const appImage='sha256:'+'d'.repeat(64),distinct={...report,runtimeComposition:{app:{...proof,imageId:appImage},scanner:proof}};
+  runtimeImagePolicy(distinct,bytes,'safedrop:verify',appImage);
+  runtimeImagePolicy(distinct,bytes,'safedrop-scanner:verify',imageId);
+  assert.throws(()=>runtimeImagePolicy(distinct,bytes,'safedrop:verify',imageId));
+  assert.throws(()=>runtimeImagePolicy(distinct,bytes,'safedrop-scanner:verify',appImage));
+  assert.throws(()=>runtimeImagePolicy(distinct,bytes,'other',imageId));
 });
 const empty = () => ({auditReportVersion:2,metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0,total:0}},vulnerabilities:{}});
 const advisory='https://example.invalid/advisory', now=Date.parse('2026-11-18T00:00:00Z');
