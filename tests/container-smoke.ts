@@ -179,6 +179,7 @@ export async function checkContainer(options: ContainerCheckOptions) {
     checks.push('HTTPS certificate/hostname validation, Vue page and security headers (single HSTS policy)');
     await assert.rejects(connect('https://attacker.invalid'));
     const peer = await connect(); await assert.rejects(peer.rpc('files.list'), /AUTH_REQUIRED/);
+    await assert.rejects(peer.rpc('events.query', { from: Date.now()-86400000, to: Date.now()+1 }), /AUTH_REQUIRED/);
     const alice = accounts.find(account => account.name === 'alice'); assert.ok(alice);
     await peer.rpc('auth.password', { name: alice.name, password: alice.password });
     checks.push('WSS origin filtering and authentication');
@@ -237,8 +238,18 @@ export async function checkContainer(options: ContainerCheckOptions) {
       checks.push('Generated accounts, completed file, renamed filename and quota values survive restart', 'Partial upload resumes at the durable offset; final SHA-256 matches', 'Audit history matches the checkpoint saved before restart');
     }
     assert.equal((await peer.rpc('hello')).meta.connection, connection);
+    const subject = await findUser(await login('admin'), alice.name);
+    const to = Date.now()+1, query = { from: to-86400000, to, limit: 2 };
+    const eventPage = (await peer.rpc('events.query',query)).meta;
+    const eventRows = eventPage.events as Metadata[], buckets = eventPage.buckets as Metadata[];
+    assert.ok(Number(eventPage.total)>0); assert.ok(eventRows.length>0&&eventRows.length<=2);
+    assert.equal(buckets.reduce((n,b)=>n+Number(b.total),0),eventPage.total);
+    assert.ok(eventRows.every(e=>e.user===alice.name||(e.detail as Metadata).ownerId===subject.id||(e.detail as Metadata).recipientId===subject.id));
+    assert.ok(Buffer.byteLength(JSON.stringify(eventPage))<=12*1024);
+    if(eventPage.nextBefore!=null){const older=(await peer.rpc('events.query',{...query,before:eventPage.nextBefore,snapshot:eventPage.snapshot})).meta;assert.equal(older.total,eventPage.total);assert.ok((older.events as Metadata[]).every(e=>Number(e.seq)<Number(eventPage.nextBefore)));}
+    checks.push('Scoped event ranges, full-range histogram and snapshot pagination');
     checks.push('The WSS connection is reused across file operations');
-    return { version: 6, phase, ok: true, checks };
+    return { version: 6, phase, ok: true, eventsQuery: true, checks };
   } finally { for (const peer of peers) peer.close(); }
 }
 

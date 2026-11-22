@@ -15,6 +15,7 @@ import { backupKeyLocation, readBackupKeys, backupKeyInfo } from './backup-keys.
 import { MfaGuard, base32, type MfaProof } from './mfa.ts';
 import { ScanGuard } from './scans.ts';
 import type { ScanEngine } from './clamd.ts';
+import { queryEvents, recentEvents } from './events.ts';
 
 export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string; scanner?: ScanEngine; scanMaxAgeMs?: number; scanClock?: () => number; deliveryClock?: () => number }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
@@ -53,7 +54,7 @@ export function createApp(config: Config) {
     auditReserved += 8192; return () => { auditReserved -= 8192; };
   }, config.scanMaxAgeMs, config.scanClock);
   const scanFields = (file: Row) => { const { state, checked, code } = scans.status(file); return { ...file, scan: { state, checked, code } }; };
-  const readOnly = new Set(['hello', 'ping', 'files.list', 'files.scan.status', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
+  const readOnly = new Set(['hello', 'ping', 'files.list', 'files.scan.status', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'events.query', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
   type DownloadJob = { abort: AbortController; done: Promise<void>; userId: string; ownerId: string; deliveryId?: string };
   const downloads = new Map<string, Set<DownloadJob>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
@@ -581,10 +582,12 @@ export function createApp(config: Config) {
       const jwk = createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: j.x, y: j.y }, format: 'jwk' }).export({ format: 'jwk' });
       const keyId = id(); store.transaction(() => { store.run('INSERT INTO keys VALUES(?,?,?,?,?)', keyId, u.id, JSON.stringify(jwk), text(m.label, 60), Date.now()); audit(c, op, 'allowed', { keyId }); }); return { meta: { keyId } };
     }
+    if (op === 'events.query') {
+      need(rate.allow('events-query:' + u.id, 60), 'RATE_LIMITED');
+      return { meta: queryEvents(store,u,m) };
+    }
     if (op === 'events.list') {
-      const events = store.all('SELECT seq,event FROM audit ORDER BY seq DESC LIMIT 300').map(r => ({ seq: r.seq, ...JSON.parse(r.event) })).filter(r => u.role === 'admin' || r.user === u.name || ['files.scan.begin', 'files.scan'].includes(r.action) && r.detail.ownerId === u.id || ['deliveries.create', 'deliveries.revoke', 'deliveries.download', 'deliveries.expire'].includes(r.action) && (r.detail.ownerId === u.id || r.detail.recipientId === u.id)).slice(0, 24);
-      while (Buffer.byteLength(JSON.stringify({ events })) > 12 * 1024) events.pop();
-      return { meta: { events } };
+      return { meta: { events: recentEvents(store,u) } };
     }
     if (op === 'audit.page') { admin(c); return { meta: { rows: store.all('SELECT * FROM audit WHERE seq>? ORDER BY seq LIMIT 8', integer(m.after ?? 0)), checkpoint: store.checkpoint() } }; }
     if (op === 'audit.verify') { admin(c); const anchor = m.checkpoint as Checkpoint | undefined; if (anchor) { integer(anchor.count); need(/^[a-f0-9]{64}$/.test(anchor.head), 'INVALID_CHECKPOINT'); } return { meta: verifyAudit(store.all('SELECT * FROM audit ORDER BY seq'), anchor) }; }
