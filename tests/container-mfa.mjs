@@ -13,6 +13,7 @@ const runtime = process.env.MFA_SMOKE_BUILD ?? resolve('build');
 // Keep Docker's Windows stdin transport ASCII-only; Node decodes the escapes.
 const enableConfirmation = '\u542f\u7528\u53cc\u56e0\u7d20\u8ba4\u8bc1';
 const { createApp } = await import(pathToFileURL(join(runtime, 'server/app.js')));
+const { DATABASE_VERSION } = await import(pathToFileURL(join(runtime, 'server/store.js')).href);
 const { totp, unbase32 } = await import(pathToFileURL(join(runtime, 'server/mfa.js')));
 const { encode, decode } = await import(pathToFileURL(join(runtime, 'shared/protocol.js')));
 const root = mkdtempSync(join(tmpdir(), 'safedrop-mfa-')); let now = Date.now();
@@ -28,7 +29,7 @@ const enter = async () => { const p = await connect(); return { p, first: await 
 try {
   const admin = (await enter()).p, setup = await admin.rpc('mfa.setup', { password }), secret = unbase32(setup.secret);
   const enabled = await admin.rpc('mfa.enable', { code: totp(secret, now), confirm: enableConfirmation }); assert.equal(enabled.recoveryCodes.length, 10);
-  assert.ok(existsSync(config.root + '.mfa-key')); assert.equal(app.store.get('PRAGMA user_version').user_version, 7);
+  assert.ok(existsSync(config.root + '.mfa-key')); assert.equal(app.store.get('PRAGMA user_version').user_version, DATABASE_VERSION);
   const pending = await enter(); assert.equal(pending.first.mfaRequired, true); await assert.rejects(pending.p.rpc('maintenance.status'), /AUTH_REQUIRED/);
   await assert.rejects(pending.p.rpc('auth.mfa', { challenge: pending.first.challenge, code: totp(secret, now) }), /MFA_INVALID/);
   now += 30000; await pending.p.rpc('auth.mfa', { challenge: pending.first.challenge, code: totp(secret, now) }); assert.equal((await pending.p.rpc('maintenance.status')).ok, true);

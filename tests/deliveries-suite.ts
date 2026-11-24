@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { WebSocket } from 'ws';
 import { createTestApp as createApp, scanFixtureFile } from './test-scanner.ts';
-import { digest, verifyAudit, Store } from '../server/store.ts';
+import { DATABASE_VERSION, digest, verifyAudit, Store } from '../server/store.ts';
 import { verifyBackup, restoreBackup } from '../server/backup.ts';
 import { changeBackupKeys } from '../server/backup-keys.ts';
 import { certificates } from '../scripts/certificates.ts';
@@ -209,7 +209,7 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     const snapshot = () => JSON.parse(execFileSync(process.execPath, [resolve('scripts/data-snapshot.mjs')], { env: { ...process.env, DATA_DIR: f.config.root }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     const before = snapshot(); await f.restart(); const after = snapshot();
     for (const [table, records] of Object.entries(before.tables)) for (const [id, hash] of Object.entries(records as Record<string, string>)) assert.equal(after.tables[table][id], hash);
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, DATABASE_VERSION); assert.equal(digest(readFileSync(join(f.config.root, 'objects', f.fileId))), digest(f.bytes));
   });
   await run('授权期限：新授权默认七天，最短一小时及最长三十天均由服务端计算', async f => {
     f.setNow(Date.now()); const now = f.config.deliveryClock();
@@ -321,7 +321,7 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     await changeBackupKeys(f.config.root + '.backup-keys'); const result = (await f.admin.rpc('maintenance.backup')).meta;
     const source = f.config.root + '.backups/' + result.id, access = { keyFile: f.config.root + '.backup-keys' }, backup = await verifyBackup(source, undefined, access), target = f.config.root + '-restored';
     await restoreBackup(source, target, backup.checkpoint, access); const restored = new Store(target);
-    try { assert.deepEqual(restored.all('SELECT * FROM deliveries ORDER BY id'), f.app.store.all('SELECT * FROM deliveries ORDER BY id')); assert.equal(restored.get('PRAGMA user_version')!.user_version, 7); assert.equal(verifyAudit(restored.all('SELECT * FROM audit ORDER BY seq'), backup.checkpoint).ok, true); }
+    try { assert.deepEqual(restored.all('SELECT * FROM deliveries ORDER BY id'), f.app.store.all('SELECT * FROM deliveries ORDER BY id')); assert.equal(restored.get('PRAGMA user_version')!.user_version, DATABASE_VERSION); assert.equal(verifyAudit(restored.all('SELECT * FROM audit ORDER BY seq'), backup.checkpoint).ok, true); }
     finally { restored.close(); }
     f.setNow(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', timed)!.expires);
     const restoredApp = createApp({ ...f.config, root: target }); restoredApp.server.listen(0, '127.0.0.1'); await once(restoredApp.server, 'listening');
@@ -335,7 +335,7 @@ export async function runDeliverySuite(onResult?: (r: Result) => void) {
     const snapshot = () => JSON.parse(execFileSync(process.execPath, [resolve('scripts/data-snapshot.mjs')], { env: { ...process.env, DATA_DIR: f.config.root }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     const before = snapshot(); await f.restart(); const after = snapshot();
     for (const [table, records] of Object.entries(before.tables)) for (const [id, hash] of Object.entries(records as Record<string, string>)) assert.equal(after.tables[table][id], hash);
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires, 0);
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, DATABASE_VERSION); assert.equal(f.app.store.get('SELECT expires FROM deliveries WHERE id=?', deliveryId)!.expires, 0);
     const reader = await f.login('reader'); assert.equal((await reader.rpc('download.chunk', { fileId: f.fileId, deliveryId, offset: 0 })).payload.length, CHUNK);
   });
   return results;

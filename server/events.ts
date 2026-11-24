@@ -4,7 +4,7 @@ const DAY = 86400000, MAX_DATE = 253402300799999;
 const scanActions = "'files.scan.begin','files.scan'";
 const deliveryActions = "'deliveries.create','deliveries.revoke','deliveries.download','deliveries.expire'";
 const quarantined = "(json_extract(event,'$.action')='files.scan' AND json_extract(event,'$.detail.state')='quarantined')";
-const fields = ['code','fileId','deliveryId','transferId','state','size','offset','expires','sender','recipient','ownerId','recipientId','method','name','oldName','engine','signature','encrypted','backupId','bytes','keyId','sessions','keys'];
+const fields = ['code','fileId','folderId','previousFolderId','deliveryId','transferId','state','size','offset','expires','sender','recipient','ownerId','recipientId','method','name','oldName','engine','signature','encrypted','backupId','bytes','keyId','sessions','keys'];
 function visibility(user: Row) {
   return user.role === 'admin' ? { sql:'1', args:[] } : {
     sql:`(json_extract(event,'$.user')=? OR

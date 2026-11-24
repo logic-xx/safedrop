@@ -15,12 +15,15 @@ async function fixture() {
   for (const [id, bytes] of [[fileId, content], [emptyId, Buffer.alloc(0)]] as const) { await writeFile(join(data, 'objects', id), bytes); store.run('INSERT INTO files VALUES(?,?,?,?,?,?)', id, user, 'private-name-' + id, bytes.length, digest(bytes), Date.now()); }
   await writeFile(join(data, 'staging', transferId), content.subarray(0, 8)); store.run('INSERT INTO transfers VALUES(?,?,?,?,?,?,?)', transferId, user, 'partial', content.length, digest(content), 8, Date.now());
   store.audit(user, 'backup-fixture', 'allowed'); const anchor = store.checkpoint(), options = { quota: 64 * 1024 ** 2, count: 20, minFree: 0, pending: 0, keyFile };
-  return { root, data, keyFile, backups, store, content, fileId, emptyId, transferId, anchor, options, backup: async () => { const result = await createBackup(store, backups, options); return { ...result, source: join(backups, result.id) }; } };
+  return { root, data, keyFile, backups, store, user, content, fileId, emptyId, transferId, anchor, options, backup: async () => { const result = await createBackup(store, backups, options); return { ...result, source: join(backups, result.id) }; } };
 }
 
 test('Encrypted backup protects the whole snapshot and restores files, offsets and audit into a new directory', async () => {
   const f = await fixture();
   try {
+    const folderId = randomUUID();
+    f.store.run('INSERT INTO folders(id,userId,name) VALUES(?,?,?)', folderId, f.user, 'private-folder');
+    f.store.run('INSERT INTO file_folders(fileId,folderId) VALUES(?,?)', f.fileId, folderId);
     const result = await f.backup(); assert.equal(result.encrypted, true);
     assert.deepEqual((await readdir(result.source)).sort(), ['manifest.json', 'sealed']);
     const header = JSON.parse(await readFile(join(result.source, 'manifest.json'), 'utf8')); assert.equal(header.version, 2); assert.equal('entries' in header, false); assert.equal('checkpoint' in header, false);
@@ -34,7 +37,13 @@ test('Encrypted backup protects the whole snapshot and restores files, offsets a
     }
     const target = join(f.root, 'restored'); await restoreBackup(result.source, target, f.anchor, { keyFile: f.keyFile });
     assert.deepEqual(await readFile(join(target, 'objects', f.fileId)), f.content); assert.equal((await lstat(join(target, 'objects', f.emptyId))).size, 0);
-    const restored = new Store(target); try { assert.equal(restored.get('SELECT offset FROM transfers WHERE id=?', f.transferId)!.offset, 8); } finally { restored.close(); }
+    const restored = new Store(target);
+    try {
+      assert.equal(restored.get('SELECT offset FROM transfers WHERE id=?', f.transferId)!.offset, 8);
+      const folder = restored.get('SELECT folders.* FROM folders JOIN file_folders ON file_folders.folderId=folders.id WHERE file_folders.fileId=?', f.fileId);
+      assert.deepEqual(folder, f.store.get('SELECT * FROM folders WHERE id=?', folderId));
+      assert.equal(folder?.userId, f.user);
+    } finally { restored.close(); }
     await assert.rejects(restoreBackup(result.source, target, f.anchor, { keyFile: f.keyFile }), /EEXIST/);
     assert.deepEqual(await readFile(join(f.data, 'objects', f.fileId)), f.content); assert.equal((await readdir(f.data)).some(name => name.startsWith('.backup-snapshot-')), false);
   } finally { f.store.close(); }

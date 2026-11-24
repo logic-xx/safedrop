@@ -14,6 +14,7 @@ const derive = (pass: string, salt: string) => new Promise<Buffer>((resolve, rej
 export async function passwordHash(pass: string) { const salt = randomBytes(16).toString('hex'); return `${salt}:${(await derive(pass, salt)).toString('hex')}`; }
 export async function passwordCheck(pass: string, hash: string) { const [salt, hex] = hash.split(':'); const actual = await derive(pass, salt); return timingSafeEqual(actual, Buffer.from(hex, 'hex')); }
 export type Row = Record<string, any>;
+export const DATABASE_VERSION = 8;
 export interface Checkpoint { count: number; head: string }
 export function verifyAudit(rows: Row[], anchor?: Checkpoint) {
   let prev = '0'.repeat(64), count = 0, anchored = !anchor || anchor.count === 0 && anchor.head === prev;
@@ -41,7 +42,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,event TEXT NOT NULL,prev TEXT NOT NULL,hash TEXT NOT NULL);`);
     // Additive, transactional migration: existing rows, objects and audit hashes stay intact.
     const version = this.get('PRAGMA user_version')!.user_version;
-    need(version <= 7, 'DATABASE_VERSION_UNSUPPORTED');
+    need(version <= DATABASE_VERSION, 'DATABASE_VERSION_UNSUPPORTED');
     if (version < 1) this.transaction(() => {
       this.db.exec(`ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE users ADD COLUMN authVersion INTEGER NOT NULL DEFAULT 0;
@@ -83,6 +84,19 @@ export class Store {
       if (!this.all('PRAGMA table_info(deliveries)').some(column => column.name === 'expires'))
         this.db.exec('ALTER TABLE deliveries ADD COLUMN expires INTEGER NOT NULL DEFAULT 0 CHECK(expires>=0);');
       this.db.exec('CREATE INDEX IF NOT EXISTS deliveries_expiry ON deliveries(expires) WHERE revoked=0 AND expires>0; PRAGMA user_version=7;');
+    });
+    if (version < 8) this.transaction(() => {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS folders(
+        id TEXT PRIMARY KEY,
+        userId TEXT NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL COLLATE NOCASE,
+        UNIQUE(userId,name)
+      );
+      CREATE TABLE IF NOT EXISTS file_folders(
+        fileId TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        folderId TEXT NOT NULL REFERENCES folders(id)
+      );
+      PRAGMA user_version=8;`);
     });
     this.auditBytes = this.get('SELECT COALESCE(SUM(length(CAST(event AS BLOB))+128),0) AS n FROM audit')!.n;
   }

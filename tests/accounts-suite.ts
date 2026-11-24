@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { createTestApp as createApp, scanFixtureFile } from './test-scanner.ts';
-import { Store, digest, passwordHash, verifyAudit } from '../server/store.ts';
+import { DATABASE_VERSION, Store, digest, passwordHash, verifyAudit } from '../server/store.ts';
 import { certificates } from '../scripts/certificates.ts';
 import { Peer, type Result } from './suite.ts';
 import { CHUNK } from '../shared/protocol.ts';
@@ -281,7 +281,7 @@ export async function runAccountSuite(onResult?: (r: Result) => void) {
       await assert.rejects(p.rpc('download.chunk', { fileId: 'legacy-file', offset: 0 }), /FILE_SCAN_REQUIRED/); await scanFixtureFile(app, 'legacy-file');
       assert.equal((await p.rpc('download.chunk', { fileId: 'legacy-file', offset: 0 })).payload.length, bytes.length);
       await p.rpc('upload.chunk', { transferId: 'legacy-transfer', offset: 3 }, bytes.subarray(3)); assert.equal((await p.rpc('upload.finish', { transferId: 'legacy-transfer' })).meta.sha256, sha);
-      const other = new Store(legacyRoot); assert.equal(other.get('PRAGMA user_version')!.user_version, 7); assert.equal(other.get('SELECT COUNT(*) AS n FROM users')!.n, 1); other.close();
+      const other = new Store(legacyRoot); assert.equal(other.get('PRAGMA user_version')!.user_version, DATABASE_VERSION); assert.equal(other.get('SELECT COUNT(*) AS n FROM users')!.n, 1); other.close();
     } finally { await app.close(); }
   }, '真实旧表结构迁移后原口令可登录、原文件可下载、原偏移可续传；公钥及历史审计保留，重复打开不再迁移。');
   return results;

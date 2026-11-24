@@ -8,7 +8,7 @@ import { randomBytes, generateKeyPairSync } from 'node:crypto';
 import { WebSocket } from 'ws';
 import { DatabaseSync } from 'node:sqlite';
 import { createTestApp as createApp, type Config } from './test-scanner.ts';
-import { digest, Store, verifyAudit, type Checkpoint } from '../server/store.ts';
+import { DATABASE_VERSION, digest, Store, verifyAudit, type Checkpoint } from '../server/store.ts';
 import { verifyBackup, restoreBackup, createBackup } from '../server/backup.ts';
 import { changeBackupKeys, readBackupKeys } from '../server/backup-keys.ts';
 import { BackupCipher, newBackupHeader } from '../server/backup-crypto.ts';
@@ -231,7 +231,7 @@ export async function runMaintenanceSuite(onResult?: (r: Result) => void) {
   await run('版本 3 迁移：既有数据行和审计不改写，旧任务按原创建时间判定', async f => {
     const id = await f.upload(Buffer.alloc(13), f.owner, false); f.app.store.db.exec('DROP TABLE mfa_settings; DROP TABLE mfa_recovery; DROP TABLE mfa_sessions; DROP TABLE mfa_attempts; DROP TABLE transfer_activity; PRAGMA user_version=3;');
     const before = JSON.stringify(f.app.store.all('SELECT * FROM transfers')); const anchor = f.app.store.checkpoint(); await f.restart();
-    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, 7); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM transfers')), before); assert.equal(verifyAudit(f.app.store.all('SELECT * FROM audit ORDER BY seq'), anchor).ok, true); assert.ok(f.app.store.get('SELECT id FROM transfers WHERE id=?', id));
+    assert.equal(f.app.store.get('PRAGMA user_version')!.user_version, DATABASE_VERSION); assert.equal(JSON.stringify(f.app.store.all('SELECT * FROM transfers')), before); assert.equal(verifyAudit(f.app.store.all('SELECT * FROM audit ORDER BY seq'), anchor).ok, true); assert.ok(f.app.store.get('SELECT id FROM transfers WHERE id=?', id));
   });
   return results;
 }

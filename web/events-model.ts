@@ -11,6 +11,7 @@ const names: Record<string,string> = {
   'upload.init':'准备上传','upload.finish':'上传完成','upload.chunk':'上传分块','upload.cancel':'取消上传',
   'upload.prepare':'准备上传','download.init':'开始下载','download.chunk':'读取下载分块',
   'files.rename':'重命名文件','files.delete':'删除文件','files.delete.requested':'请求删除文件',
+  'folders.create':'新建文件夹','files.move':'移动文件',
   'upload.cancel.requested':'请求取消上传','files.scan.request':'请求文件扫描','files.scan.begin':'开始文件扫描',
   'files.scan':'文件扫描结果','deliveries.create':'创建交付授权','deliveries.download':'开始接收下载',
   'deliveries.revoke':'撤销交付授权','deliveries.expire':'交付授权到期',

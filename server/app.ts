@@ -19,6 +19,7 @@ import { queryEvents, recentEvents } from './events.ts';
 
 export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string; scanner?: ScanEngine; scanMaxAgeMs?: number; scanClock?: () => number; deliveryClock?: () => number }
 interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
+const MAX_FOLDERS = 32; // Keep the account's folder list within one SFT/1 frame.
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
 }
@@ -54,7 +55,7 @@ export function createApp(config: Config) {
     auditReserved += 8192; return () => { auditReserved -= 8192; };
   }, config.scanMaxAgeMs, config.scanClock);
   const scanFields = (file: Row) => { const { state, checked, code } = scans.status(file); return { ...file, scan: { state, checked, code } }; };
-  const readOnly = new Set(['hello', 'ping', 'files.list', 'files.scan.status', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'events.query', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
+  const readOnly = new Set(['hello', 'ping', 'files.list', 'folders.list', 'files.scan.status', 'transfers.list', 'storage.usage', 'sessions.list', 'keys.list', 'events.list', 'events.query', 'invitations.list', 'users.list', 'report.latest', 'audit.page', 'audit.verify', 'maintenance.status', 'mfa.status']);
   type DownloadJob = { abort: AbortController; done: Promise<void>; userId: string; ownerId: string; deliveryId?: string };
   const downloads = new Map<string, Set<DownloadJob>>();
   let hashing = 0, authenticating = 0, queuedBytes = 0;
@@ -471,7 +472,44 @@ export function createApp(config: Config) {
       await stopDownloads(job => job.deliveryId === d.id); return {};
     }
     if (op === 'storage.usage') return { meta: store.usage(u.id, config.quota ?? 1024 ** 3) };
-    if (op === 'files.list') return { meta: { files: store.all("SELECT f.id,f.name,f.size,f.sha256,f.created,d.id IS NOT NULL AS deleting FROM files f LEFT JOIN deletions d ON d.id=f.id AND d.kind='files' WHERE f.userId=? ORDER BY f.created DESC,f.id DESC LIMIT 12 OFFSET ?", u.id, integer(m.offset ?? 0, 10000)).map(scanFields) } };
+    if (op === 'files.list') {
+      const files = store.all(`SELECT f.id,f.name,f.size,f.sha256,f.created,folder.id AS folderId,d.id IS NOT NULL AS deleting
+        FROM files f LEFT JOIN deletions d ON d.id=f.id AND d.kind='files'
+        LEFT JOIN file_folders link ON link.fileId=f.id
+        LEFT JOIN folders folder ON folder.id=link.folderId AND folder.userId=f.userId
+        WHERE f.userId=? ORDER BY f.created DESC,f.id DESC LIMIT 12 OFFSET ?`, u.id, integer(m.offset ?? 0, 10000));
+      return { meta: { files: files.map(scanFields) } };
+    }
+    if (op === 'folders.list') {
+      return { meta: { folders: store.all('SELECT id,name FROM folders WHERE userId=? ORDER BY name,id LIMIT ?', u.id, MAX_FOLDERS) } };
+    }
+    if (op === 'folders.create') {
+      need(rate.allow('file-mutation:' + u.id, 60), 'RATE_LIMITED');
+      const name = filename(text(m.name).trim()).normalize('NFC');
+      need(name.length <= 80 && Buffer.byteLength(name) <= 160, 'INVALID_FOLDER_NAME');
+      const folder = { id: id(), name };
+      store.transaction(() => {
+        need(!store.get('SELECT id FROM folders WHERE userId=? AND name=?', u.id, name), 'FOLDER_NAME_EXISTS');
+        need(store.get('SELECT COUNT(*) AS n FROM folders WHERE userId=?', u.id)!.n < MAX_FOLDERS, 'FOLDER_LIMIT');
+        store.run('INSERT INTO folders(id,userId,name) VALUES(?,?,?)', folder.id, u.id, name);
+        audit(c, op, 'allowed', { folderId: folder.id, name });
+      });
+      return { meta: { folder } };
+    }
+    if (op === 'files.move') {
+      need(rate.allow('file-mutation:' + u.id, 60), 'RATE_LIMITED');
+      const file = available(c, 'files', m.fileId);
+      const folderId = m.folderId === null ? null : text(m.folderId, 80);
+      if (folderId) need(store.get('SELECT id FROM folders WHERE id=? AND userId=?', folderId, u.id), 'NOT_FOUND');
+      store.transaction(() => {
+        const previous = store.get('SELECT folderId FROM file_folders WHERE fileId=?', file.id)?.folderId ?? null;
+        if (previous === folderId) return;
+        if (folderId === null) store.run('DELETE FROM file_folders WHERE fileId=?', file.id);
+        else store.run('INSERT INTO file_folders(fileId,folderId) VALUES(?,?) ON CONFLICT(fileId) DO UPDATE SET folderId=excluded.folderId', file.id, folderId);
+        audit(c, op, 'allowed', { fileId: file.id, previousFolderId: previous, folderId });
+      });
+      return { meta: { fileId: file.id, folderId } };
+    }
     if (op === 'files.scan.status') { const { file } = accessible(c, m.fileId, m.deliveryId); return { meta: { fileId: file.id, scan: scans.status(file) } }; }
     if (op === 'files.scan') {
       const file = available(c, 'files', m.fileId);

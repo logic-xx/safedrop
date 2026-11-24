@@ -13,6 +13,7 @@ import { Client, human, hashBlob, hex, bindKey, loginWithKey, localGet, localPut
 import { sessionRequests } from './session-requests.ts';
 import AccountAdmin from './AccountAdmin.vue';
 import FileAction from './FileAction.vue';
+import FileFolders from './FileFolders.vue';
 import SendFile from './SendFile.vue';
 import DeliveryCenter from './DeliveryCenter.vue';
 import Maintenance from './Maintenance.vue';
@@ -21,11 +22,14 @@ import ScanBadge from './ScanBadge.vue';
 import SecurityEvents from './SecurityEvents.vue';
 import { downloadReference, downloadAccess } from './download-reference.ts';
 type Row = Record<string, any>;
+type Folder = { id: string; name: string };
 type SavedDownload = { handle: FileSystemFileHandle; offset: number };
 type Task = { key: string; owner: string; name: string; kind: 'upload' | 'download'; total: number; done: number; status: string; paused: boolean; running?: boolean; file?: File; row?: Row; error?: string; transferId?: string; resumeKey?: string; terminal?: string; directory?: FileSystemDirectoryHandle; batchFile?: SavedDownload };
 const client = new Client(), connection = ref('offline'), user = ref<Row>(), session = ref(''), name = ref('admin'), password = ref(''), busy = ref(false), notice = ref('');
 const secureTransport = location.protocol === 'https:';
 const tab = ref('files'), files = ref<Row[]>([]), transfers = ref<Row[]>([]), sessions = ref<Row[]>([]), events = ref<Row[]>([]), keys = ref<Row[]>([]), report = ref<Row | null>(null), tasks = ref<Task[]>([]), search = ref(''), auditResult = ref(''), reauth = ref('');
+const folders = ref<Folder[]>([]), folderId = ref<string | null>(null);
+const currentFolder = computed(() => folders.value.find(folder => folder.id === folderId.value));
 const uploading = ref<HTMLInputElement>(), anchorInput = ref<HTMLInputElement>();
 const preparingDownloads = ref(new Set<string>());
 const selectedFiles = ref(new Set<string>()), choosingDirectory = ref(false);
@@ -39,25 +43,37 @@ const accountRpc = computed(() => sessionRequests(client, session.value, () => s
 const accountAdmin = ref<InstanceType<typeof AccountAdmin>>(), deliveryCenter = ref<InstanceType<typeof DeliveryCenter>>(), maintenance = ref<InstanceType<typeof Maintenance>>();
 const securityEvents = ref<InstanceType<typeof SecurityEvents>>();
 const sending = ref<Row>();
-const list = computed(() => files.value.filter(f => f.name.toLowerCase().includes(search.value.toLowerCase())));
+const currentFiles = computed(() => files.value.filter(file => (file.folderId ?? null) === (currentFolder.value?.id ?? null)));
+const list = computed(() => currentFiles.value.filter(f => f.name.toLowerCase().includes(search.value.toLowerCase())));
 const denied = computed(() => events.value.filter(e => e.result === 'denied').length);
-const usage = ref<Row>(), fileAction = ref<{ file: Row; mode: 'rename' | 'delete' }>();
+const usage = ref<Row>(), fileAction = ref<{ file: Row; mode: 'rename' | 'delete' | 'move' }>();
 const visibleTasks = computed(() => tasks.value.filter(t => t.owner === user.value?.name));
 const active = computed(() => visibleTasks.value.filter(t => t.running).length);
 const batchFiles = computed(() => list.value.filter(canBatchDownload));
 const selectedBatchFiles = computed(() => batchFiles.value.filter(file => selectedFiles.value.has(file.id)));
-watch([search, session], () => selectedFiles.value.clear());
+watch([search, session, folderId], () => selectedFiles.value.clear());
 const size = (n: number) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 const time = (n: number | string) => new Date(n).toLocaleString('zh-CN', { hour12: false });
 const percent = (t: Task) => t.total ? Math.floor(t.done / t.total * 100) : t.status === '已完成' ? 100 : 0;
 const progressValue = (t: Task) => t.total ? t.done : t.status === '已完成' ? 1 : 0;
 function pauseTasks() { for (const t of tasks.value) if (t.status !== '已完成') t.paused = true; }
 client.onState = s => connection.value = s;
-client.onLost = (reason = '') => { if (user.value) { confirmation.value = ''; invitation.value = ''; } if (['ACCOUNT_DISABLED', 'PASSWORD_CHANGED', 'SESSION_REVOKED', 'MFA_CHANGED'].includes(reason)) notice.value = human(reason); mfaChallenge.value = ''; mfaCode.value = ''; recoveryLogin.value = false; pauseTasks(); user.value = undefined; session.value = ''; tab.value = 'files'; reauth.value = ''; currentPassword.value = ''; newPassword.value = ''; passwordError.value = ''; usage.value = undefined; fileAction.value = undefined; sending.value = undefined; files.value = []; transfers.value = []; sessions.value = []; events.value = []; report.value = null; keys.value = []; };
+function openFolder(next: string | null) {
+  folderId.value = next;
+  search.value = '';
+  fileAction.value = undefined;
+  sending.value = undefined;
+}
+function folderCreated(folder: Folder) {
+  if (!folders.value.some(item => item.id === folder.id)) folders.value.push(folder);
+  notice.value = '文件夹已创建。';
+}
+client.onLost = (reason = '') => { if (user.value) { confirmation.value = ''; invitation.value = ''; } if (['ACCOUNT_DISABLED', 'PASSWORD_CHANGED', 'SESSION_REVOKED', 'MFA_CHANGED'].includes(reason)) notice.value = human(reason); mfaChallenge.value = ''; mfaCode.value = ''; recoveryLogin.value = false; pauseTasks(); user.value = undefined; session.value = ''; tab.value = 'files'; reauth.value = ''; currentPassword.value = ''; newPassword.value = ''; passwordError.value = ''; usage.value = undefined; fileAction.value = undefined; sending.value = undefined; files.value = []; folders.value = []; folderId.value = null; transfers.value = []; sessions.value = []; events.value = []; report.value = null; keys.value = []; };
 async function attempt(fn: () => Promise<unknown>) { notice.value = ''; try { await fn(); } catch (e) { notice.value = human(e); } }
 async function refresh() {
   if (!user.value || user.value.recoveryOnly) return;
   const scoped = sessionRequests(client, session.value, () => session.value), isAdmin = user.value.role === 'admin';
+  folders.value = (await scoped.rpc('folders.list')).meta.folders as Folder[];
   const all: Row[] = []; for (let offset = 0; offset <= 1000; offset += 12) { const f = await scoped.rpc('files.list', { offset }); const page = f.meta.files as Row[]; all.push(...page); if (page.length < 12) break; } files.value = all;
   if (fileAction.value) { const current = all.find(f => f.id === fileAction.value!.file.id); if (current) fileAction.value = { ...fileAction.value, file: current }; else fileAction.value = undefined; }
   transfers.value = (await scoped.rpc('transfers.list')).meta.transfers as Row[];
@@ -168,8 +184,13 @@ async function cancelPending(row: Row) {
     await refresh();
   });
 }
-async function fileChanged(mode: 'rename' | 'delete', file: Row) {
+async function fileChanged(mode: 'rename' | 'delete' | 'move', file: Row) {
   fileAction.value = undefined;
+  if (mode === 'move') {
+    selectedFiles.value.delete(file.id);
+    await attempt(async () => { await refresh(); notice.value = '文件已移动。'; });
+    return;
+  }
   for (const t of visibleTasks.value) if (t.kind === 'download' && t.row?.id === file.id) {
     if (mode === 'rename') { t.name = file.name; t.row = file; }
     else if (t.status !== '已完成') { t.paused = true; t.terminal = t.status = '源文件已删除'; }
@@ -344,10 +365,12 @@ onUnmounted(() => { clearInterval(poll); clearInterval(heartbeat); client.stop()
     <main><header class="topbar"><span>工作空间 <span class="crumb">/</span> {{ labels[tab] }}</span><span class="connection"><i :class="connection === 'online' ? 'dot' : 'dot gray'"></i>{{ connection === 'online' ? (secureTransport ? '安全连接已建立' : '本地界面测试连接') : '连接已断开' }}</span></header><div class="page"><div class="page-heading"><div><span class="eyebrow">{{ tab === 'files' ? 'YOUR SECURE WORKSPACE' : tab === 'security' ? 'VISIBILITY & CONTROL' : tab === 'deliveries' ? 'SEND & RECEIVE' : tab === 'maintenance' ? 'STORAGE & MAINTENANCE' : tab === 'accounts' ? 'ACCOUNTS & INVITATIONS' : 'VERIFY, THEN TRUST' }}</span><h1>{{ labels[tab] }}</h1><p>{{ user.recoveryOnly ? '使用当前口令和新验证器完成重新绑定，恢复正常访问。' : tab === 'files' ? '管理文件与传输任务，每一次完成都经过完整性校验。' : tab === 'security' ? '查看真实安全事件，管理在线会话与本机身份。' : tab === 'deliveries' ? '发送自己的文件，查看收到的文件并管理接收授权。' : tab === 'maintenance' ? '查看资源预算，维护未完成上传与受保护备份。' : tab === 'accounts' ? '控制注册入口，生成单次邀请并管理账号状态。' : '用可复现的测试和可校验的记录，验证安全设计。' }}</p></div><button class="secondary" @click="attempt(refreshVisible)">↻ 刷新数据</button></div><div v-if="notice" class="notice dismiss" role="status">{{ notice }}<button @click="notice = ''">×</button></div>
     <template v-if="tab === 'files'"><div class="stats"><article><span>已用空间</span><strong>{{ usage ? size(usage.used) : '—' }}</strong><p>已完成文件，含删除待重试的占用</p></article><article><span>上传预留空间</span><strong>{{ usage ? size(usage.reserved) : '—' }}</strong><p>未完成上传按完整文件大小预留</p></article><article><span>可用空间</span><strong>{{ usage ? size(usage.available) : '—' }}</strong><p>账号配额减去已用与预留空间</p></article></div><div class="quota-summary"><span>账号配额 {{ usage ? size(usage.limit) : '—' }}</span><span>我的文件 {{ usage?.fileCount ?? '—' }} 个</span><span>未完成上传 {{ usage?.transferCount ?? '—' }} 个</span><span>传输上限 {{ size(user.rate) }}/s · 双向及多会话共享</span></div><p v-if="usage?.overQuota" class="form-error">当前占用超过账号配额，请删除文件或取消未完成上传后再上传。</p>
 
-    <section class="upload-zone" @dragover.prevent @drop.prevent="enqueue($event.dataTransfer?.files ?? null)"><div class="upload-icon">↑</div><div><h3>将文件拖到这里，开始安全传输</h3><p>支持多任务与断点续传 · 单文件最大 512 MB</p></div><button class="primary" @click="uploading?.click()">＋ 选择文件</button><input ref="uploading" hidden type="file" multiple @change="enqueue(($event.target as HTMLInputElement).files)"></section>
-    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><div class="file-tools"><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"><button v-if="directoryPicker" type="button" class="secondary" :disabled="!selectedBatchFiles.length || choosingDirectory" @click="batchDownload">{{ choosingDirectory ? '等待选择目录…' : selectedBatchFiles.length ? `批量下载 (${selectedBatchFiles.length})` : '批量下载' }}</button></div></div><p class="report-meta">上传完成后自动进行本地安全扫描，通过后才可下载或发送。旧文件需要请求扫描；隔离或失败不会自动删除文件，也不会释放占用。</p><div class="table-scroll"><table><thead><tr><th v-if="directoryPicker" class="file-select"><input type="checkbox" aria-label="选择当前列表中可批量下载的文件" :checked="batchFiles.length > 0 && selectedBatchFiles.length === batchFiles.length" :indeterminate="selectedBatchFiles.length > 0 && selectedBatchFiles.length < batchFiles.length" :disabled="!batchFiles.length || choosingDirectory" @change="selectBatchFiles(($event.target as HTMLInputElement).checked)"></th><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性与扫描</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td v-if="directoryPicker" class="file-select"><input type="checkbox" :checked="selectedFiles.has(f.id)" @change="($event.target as HTMLInputElement).checked ? selectedFiles.add(f.id) : selectedFiles.delete(f.id)" :aria-label="`选择 ${f.name}`" :disabled="choosingDirectory || !canBatchDownload(f)"></td><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span><ScanBadge :scan="f.scan" /></td><td class="file-buttons"><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean' || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean'" @click="sending = f; fileAction = undefined">发送给用户</button><button class="link" :disabled="f.deleting || ['pending','scanning'].includes(f.scan?.state)" @click="scanFile(f)">{{ f.scan?.state === 'clean' ? '重新扫描' : f.scan?.state === 'error' || f.scan?.state === 'quarantined' ? '重试扫描' : '请求扫描' }}</button><button class="link" :disabled="f.deleting || f.scan?.state === 'scanning'" @click="sending = undefined; fileAction = { file: f, mode: 'rename' }">重命名</button><button class="link danger" @click="sending = undefined; fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td :colspan="directoryPicker ? 6 : 5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
+    <section v-if="!currentFolder" class="upload-zone" @dragover.prevent @drop.prevent="enqueue($event.dataTransfer?.files ?? null)"><div class="upload-icon">↑</div><div><h3>将文件拖到这里，开始安全传输</h3><p>支持多任务与断点续传 · 单文件最大 512 MB</p></div><button class="primary" @click="uploading?.click()">＋ 选择文件</button><input ref="uploading" hidden type="file" multiple @change="enqueue(($event.target as HTMLInputElement).files)"></section>
+    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ currentFiles.length }}</span></h3><div class="file-tools"><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"><button v-if="directoryPicker" type="button" class="secondary" :disabled="!selectedBatchFiles.length || choosingDirectory" @click="batchDownload">{{ choosingDirectory ? '等待选择目录…' : selectedBatchFiles.length ? `批量下载 (${selectedBatchFiles.length})` : '批量下载' }}</button></div></div>
+      <FileFolders :folders="folders" :current="currentFolder" :rpc="accountRpc" @open="openFolder" @created="folderCreated" />
+      <p class="report-meta">上传完成后自动进行本地安全扫描，通过后才可下载或发送。旧文件需要请求扫描；隔离或失败不会自动删除文件，也不会释放占用。</p><div class="table-scroll"><table><thead><tr><th v-if="directoryPicker" class="file-select"><input type="checkbox" aria-label="选择当前列表中可批量下载的文件" :checked="batchFiles.length > 0 && selectedBatchFiles.length === batchFiles.length" :indeterminate="selectedBatchFiles.length > 0 && selectedBatchFiles.length < batchFiles.length" :disabled="!batchFiles.length || choosingDirectory" @change="selectBatchFiles(($event.target as HTMLInputElement).checked)"></th><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性与扫描</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td v-if="directoryPicker" class="file-select"><input type="checkbox" :checked="selectedFiles.has(f.id)" @change="($event.target as HTMLInputElement).checked ? selectedFiles.add(f.id) : selectedFiles.delete(f.id)" :aria-label="`选择 ${f.name}`" :disabled="choosingDirectory || !canBatchDownload(f)"></td><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span><ScanBadge :scan="f.scan" /></td><td class="file-buttons"><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean' || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean'" @click="sending = f; fileAction = undefined">发送给用户</button><button class="link" :disabled="f.deleting || ['pending','scanning'].includes(f.scan?.state)" @click="scanFile(f)">{{ f.scan?.state === 'clean' ? '重新扫描' : f.scan?.state === 'error' || f.scan?.state === 'quarantined' ? '重试扫描' : '请求扫描' }}</button><button class="link" :disabled="f.deleting || f.scan?.state === 'scanning'" @click="sending = undefined; fileAction = { file: f, mode: 'rename' }">重命名</button><button v-if="folders.length" class="link" :disabled="f.deleting" @click="sending = undefined; fileAction = { file: f, mode: 'move' }">移动到</button><button class="link danger" @click="sending = undefined; fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td :colspan="directoryPicker ? 6 : 5" class="empty">{{ search ? '没有匹配的文件' : currentFolder ? '这个文件夹还没有文件。' : '根目录没有文件。' }}</td></tr></tbody></table></div></section>
     <SendFile v-if="sending" :key="sending.id" :file="sending" :rpc="accountRpc" @close="sending = undefined" />
-    <FileAction v-if="fileAction" :key="fileAction.file.id + fileAction.mode" :file="fileAction.file" :mode="fileAction.mode" :rpc="accountRpc" @close="fileAction = undefined" @changed="fileChanged" @refresh="attempt(refresh)" />
+    <FileAction v-if="fileAction" :key="fileAction.file.id + fileAction.mode" :file="fileAction.file" :folders="folders" :mode="fileAction.mode" :rpc="accountRpc" @close="fileAction = undefined" @changed="fileChanged" @refresh="attempt(refresh)" />
 
     <section v-if="transfers.length" class="card"><div class="card-heading"><h3>服务端未完成上传</h3><span class="muted">取消待重试的任务仍占用预留空间</span></div><div v-for="t in transfers" :key="t.id" class="pending-row"><span>{{ t.name }}</span><small>{{ t.deleting ? '取消待重试 · ' : '' }}{{ size(t.offset) }} / {{ size(t.size) }}</small><button class="link danger" @click="cancelPending(t)">{{ t.deleting ? '重试取消清理' : '取消并清理上传' }}</button></div></section><p class="footnote">断点下载建议使用桌面版 Edge / Chrome；每 4 MB 保存检查点，暂停时保存当前位置。其他浏览器支持 32 MB 以内的普通下载。</p>
     </template>

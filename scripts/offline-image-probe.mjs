@@ -101,6 +101,13 @@ export async function probeOfflineImages({ origin, ca, password, stale = false }
     }
     assert.equal(scan.state, 'clean', `Scan did not pass: ${scan.state} ${scan.code}`);
 
+    const folder = (await rpc('folders.create', { name: 'SafeDrop review folder' })).meta.folder;
+    assert.deepEqual((await rpc('folders.list')).meta.folders, [folder]);
+    assert.equal((await rpc('files.move', { fileId, folderId: folder.id })).meta.folderId, folder.id);
+    const moved = (await rpc('files.list')).meta.files.find(file => file.id === fileId);
+    assert.equal(moved.folderId, folder.id);
+    assert.equal(moved.scan.state, 'clean');
+    assert.equal(moved.sha256, hash);
     const info = (await rpc('download.init', { fileId })).meta;
     assert.equal(info.size, bytes.length);
     assert.equal(info.sha256, hash);
@@ -116,8 +123,10 @@ export async function probeOfflineImages({ origin, ca, password, stale = false }
     const downloaded = Buffer.concat(parts);
     assert.deepEqual(downloaded, bytes);
     assert.equal(sha256(downloaded), hash);
+    assert.equal((await rpc('files.move', { fileId, folderId: null })).meta.folderId, null);
+    assert.equal((await rpc('files.list')).meta.files.find(file => file.id === fileId).folderId, null);
     await rpc('auth.logout');
-    return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: 'clean', engine: scan.engine, downloadedBytes: downloaded.length, sha256: hash };
+    return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: 'clean', engine: scan.engine, downloadedBytes: downloaded.length, sha256: hash, folderMove: 'into-folder-and-back' };
   } finally {
     ws.terminate();
   }

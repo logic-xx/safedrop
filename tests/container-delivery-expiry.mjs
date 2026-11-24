@@ -9,7 +9,7 @@ import {setTimeout as pause} from 'node:timers/promises';
 import {WebSocket} from 'ws';
 import {createApp} from './build/server/app.js';
 import {ClamdEngine} from './build/server/clamd.js';
-import {digest,Store} from './build/server/store.js';
+import {DATABASE_VERSION,digest,Store} from './build/server/store.js';
 import {verifyBackup,restoreBackup} from './build/server/backup.js';
 import {changeBackupKeys} from './build/server/backup-keys.js';
 import {encode,decode} from './build/shared/protocol.js';
@@ -53,7 +53,7 @@ try{
  const events=(await reader.rpc('events.list')).meta.events;assert.ok(events.some(e=>e.action==='deliveries.expire'&&e.detail.deliveryId===old.deliveryId));assert.ok(!(await other.rpc('events.list')).meta.events.some(e=>e.detail.deliveryId===old.deliveryId));
  checks.push('expiry events remain visible only to participants and administrators');
  await changeBackupKeys(config.root+'.backup-keys');const backup=(await admin.rpc('maintenance.backup')).meta,source=config.root+'.backups/'+backup.id,access={keyFile:config.root+'.backup-keys'},manifest=await verifyBackup(source,undefined,access),target=join(root,'restored');await restoreBackup(source,target,manifest.checkpoint,access);
- const restored=new Store(target);try{assert.equal(restored.get('PRAGMA user_version').user_version,7);assert.deepEqual(restored.all('SELECT * FROM deliveries ORDER BY id'),app.store.all('SELECT * FROM deliveries ORDER BY id'));}finally{restored.close();}
+ const restored=new Store(target);try{assert.equal(restored.get('PRAGMA user_version').user_version,DATABASE_VERSION);assert.deepEqual(restored.all('SELECT * FROM deliveries ORDER BY id'),app.store.all('SELECT * FROM deliveries ORDER BY id'));}finally{restored.close();}
  await app.close();app=createApp({...config,root:target});await start();reader=await login('expiry-reader');other=await login('expiry-other');await assert.rejects(reader.rpc('download.init',{fileId,deliveryId:old.deliveryId}),/DELIVERY_EXPIRED/);assert.equal((await reader.rpc('download.chunk',{fileId,deliveryId:active.deliveryId,offset:0})).payload.length,bytes.length);assert.equal((await other.rpc('download.chunk',{fileId,deliveryId:legacy.deliveryId,offset:0})).payload.length,bytes.length);
  checks.push('encrypted backup and fresh-directory restore preserve exact expiry and authorization behavior');
  console.log(JSON.stringify({ok:true,version:1,node:process.version,platform:process.platform,databaseVersion:7,scope:'compiled final runtime, real scanner and isolated temporary accounts',checks,realScanner:true,strictDeadline:true,waitCancelled:true,restart:true,legacy:true,resend:true,encryptedBackupRestore:true,originalAccountsChanged:false,originalDataChanged:false}));
