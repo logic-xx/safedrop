@@ -35,7 +35,7 @@ async function health(origin, ca) {
   }
 }
 
-export async function probeOfflineImages({ origin, ca, password }) {
+export async function probeOfflineImages({ origin, ca, password, stale = false }) {
   await health(origin, ca);
   const ws = new WebSocket(`${origin.replace('https:', 'wss:')}/ws`, {
     ca, rejectUnauthorized: true, origin, handshakeTimeout: 5000,
@@ -88,11 +88,18 @@ export async function probeOfflineImages({ origin, ca, password }) {
     let scan;
     do {
       scan = (await rpc('files.scan.status', { fileId })).meta.scan;
-      if (scan.state === 'clean') break;
-      assert.ok(['pending', 'scanning'].includes(scan.state), `Scan did not pass: ${scan.state} ${scan.code}`);
+      if (!['pending', 'scanning'].includes(scan.state)) break;
       await pause(500);
     } while (Date.now() < deadline);
-    assert.equal(scan.state, 'clean', 'Timed out waiting for the real scan result');
+    if (stale) {
+      assert.equal(scan.state, 'error');
+      assert.equal(scan.code, 'SCAN_DATABASE_STALE');
+      await assert.rejects(rpc('download.init', { fileId }), { message: 'download.init: FILE_SCAN_REQUIRED' });
+      await assert.rejects(rpc('deliveries.create', { fileId, recipient: 'bob' }), { message: 'deliveries.create: FILE_SCAN_REQUIRED' });
+      await rpc('auth.logout');
+      return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: scan.code, download: 'denied', delivery: 'denied' };
+    }
+    assert.equal(scan.state, 'clean', `Scan did not pass: ${scan.state} ${scan.code}`);
 
     const info = (await rpc('download.init', { fileId })).meta;
     assert.equal(info.size, bytes.length);
@@ -106,9 +113,11 @@ export async function probeOfflineImages({ origin, ca, password }) {
       assert.equal(reply.meta.eof, next === bytes.length);
       parts.push(Buffer.from(reply.payload));
     }
-    assert.deepEqual(Buffer.concat(parts), bytes);
+    const downloaded = Buffer.concat(parts);
+    assert.deepEqual(downloaded, bytes);
+    assert.equal(sha256(downloaded), hash);
     await rpc('auth.logout');
-    return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: 'clean', downloadedBytes: bytes.length, sha256: hash };
+    return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: 'clean', engine: scan.engine, downloadedBytes: downloaded.length, sha256: hash };
   } finally {
     ws.terminate();
   }

@@ -1,8 +1,12 @@
 <style scoped>
 .file-buttons{flex-wrap:wrap;gap:4px 12px;min-width:145px;max-width:190px}
+.file-tools{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px}
+.file-tools button{font-size:11px}
+.file-select{padding-right:0;width:1%}
+.file-select input{width:16px;height:16px;margin:0;vertical-align:middle;accent-color:#218368}
 </style>
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CHUNK } from '../shared/protocol.ts';
 import { Client, human, hashBlob, hex, bindKey, loginWithKey, localGet, localPut, saveJSON } from './client.ts';
@@ -17,12 +21,16 @@ import ScanBadge from './ScanBadge.vue';
 import SecurityEvents from './SecurityEvents.vue';
 import { downloadReference, downloadAccess } from './download-reference.ts';
 type Row = Record<string, any>;
-type Task = { key: string; owner: string; name: string; kind: 'upload' | 'download'; total: number; done: number; status: string; paused: boolean; running?: boolean; file?: File; row?: Row; error?: string; transferId?: string; resumeKey?: string; terminal?: string };
+type SavedDownload = { handle: FileSystemFileHandle; offset: number };
+type Task = { key: string; owner: string; name: string; kind: 'upload' | 'download'; total: number; done: number; status: string; paused: boolean; running?: boolean; file?: File; row?: Row; error?: string; transferId?: string; resumeKey?: string; terminal?: string; directory?: FileSystemDirectoryHandle; batchFile?: SavedDownload };
 const client = new Client(), connection = ref('offline'), user = ref<Row>(), session = ref(''), name = ref('admin'), password = ref(''), busy = ref(false), notice = ref('');
 const secureTransport = location.protocol === 'https:';
 const tab = ref('files'), files = ref<Row[]>([]), transfers = ref<Row[]>([]), sessions = ref<Row[]>([]), events = ref<Row[]>([]), keys = ref<Row[]>([]), report = ref<Row | null>(null), tasks = ref<Task[]>([]), search = ref(''), auditResult = ref(''), reauth = ref('');
 const uploading = ref<HTMLInputElement>(), anchorInput = ref<HTMLInputElement>();
 const preparingDownloads = ref(new Set<string>());
+const selectedFiles = ref(new Set<string>()), choosingDirectory = ref(false);
+const directoryPicker = (window as Window & { showDirectoryPicker?: (options: { mode: 'readwrite' }) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+const reservingBatchNames = new Set<string>();
 const registration = ref(''), registering = ref(false), invitation = ref(''), newPassword = ref(''), confirmation = ref(''), currentPassword = ref(''), changing = ref(false);
 const passwordError = ref(''), passwordFeedback = ref<HTMLElement>();
 const mfaChallenge = ref(''), mfaCode = ref(''), recoveryLogin = ref(false);
@@ -36,6 +44,9 @@ const denied = computed(() => events.value.filter(e => e.result === 'denied').le
 const usage = ref<Row>(), fileAction = ref<{ file: Row; mode: 'rename' | 'delete' }>();
 const visibleTasks = computed(() => tasks.value.filter(t => t.owner === user.value?.name));
 const active = computed(() => visibleTasks.value.filter(t => t.running).length);
+const batchFiles = computed(() => list.value.filter(canBatchDownload));
+const selectedBatchFiles = computed(() => batchFiles.value.filter(file => selectedFiles.value.has(file.id)));
+watch([search, session], () => selectedFiles.value.clear());
 const size = (n: number) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 const time = (n: number | string) => new Date(n).toLocaleString('zh-CN', { hour12: false });
 const percent = (t: Task) => t.total ? Math.floor(t.done / t.total * 100) : t.status === '已完成' ? 100 : 0;
@@ -117,7 +128,15 @@ function enqueue(filesToAdd: FileList | null) {
   for (const file of [...filesToAdd]) { if (visibleTasks.value.some(t => t.kind === 'upload' && t.name === file.name && t.total === file.size && t.status !== '已完成' && !t.terminal)) continue; tasks.value.push({ key: crypto.randomUUID(), owner: user.value.name, name: file.name, total: file.size, done: 0, kind: 'upload', status: '等待传输', paused: false, file }); }
   if (uploading.value) uploading.value.value = ''; schedule();
 }
-function schedule() { for (const t of visibleTasks.value) { if (active.value >= 3) break; if (!t.terminal && !t.running && !t.paused && t.status === '等待传输') void upload(t); } }
+function schedule() {
+  if (!user.value || user.value.recoveryOnly) return;
+  for (const task of visibleTasks.value) {
+    if (active.value >= 3) break;
+    if (task.terminal || task.running || task.paused || task.status !== '等待传输') continue;
+    if (task.kind === 'upload') void upload(task);
+    else void runDownload(task);
+  }
+}
 async function upload(t: Task) {
   if (!t.file || !user.value || t.owner !== user.value.name) return;
   t.running = true; t.status = '计算文件摘要'; t.error = ''; const account = user.value.name;
@@ -161,54 +180,132 @@ async function scanFile(file: Row) {
   const scoped = sessionRequests(client, session.value, () => session.value);
   await attempt(async () => { await scoped.rpc('files.scan', { fileId: file.id }); await refresh(); notice.value = '扫描请求已登记。只有扫描通过后才能下载和交付；检测到威胁或扫描失败时，原文件和占用仍保留。'; });
 }
-function downloadPreparing(row: Row) { return preparingDownloads.value.has(`${session.value}:${downloadReference(row as { id: string; deliveryId?: string })}`); }
+const downloadKey = (row: Row) => downloadReference(row as { id: string; deliveryId?: string });
+const downloadPreparing = (row: Row) => preparingDownloads.value.has(`${session.value}:${downloadKey(row)}`);
+function unfinishedDownload(row: Row) {
+  return visibleTasks.value.find(task => task.kind === 'download' && task.row && !task.terminal &&
+    task.status !== '已完成' && downloadKey(task.row) === downloadKey(row));
+}
+function canBatchDownload(row: Row) {
+  return !row.deleting && row.scan?.state === 'clean' && !downloadPreparing(row) && !unfinishedDownload(row);
+}
+function selectBatchFiles(checked: boolean) {
+  selectedFiles.value = new Set(checked ? batchFiles.value.map(file => file.id) : []);
+}
+function newDownload(row: Row, directory?: FileSystemDirectoryHandle) {
+  tasks.value.push({
+    key: crypto.randomUUID(), owner: user.value!.name, name: row.name, kind: 'download',
+    total: row.size, done: 0, row, status: '等待传输', paused: false, directory,
+  });
+  return tasks.value[tasks.value.length - 1];
+}
+async function batchDownload() {
+  if (!directoryPicker || choosingDirectory.value || !selectedBatchFiles.value.length) return;
+  const selected = new Set(selectedBatchFiles.value.map(file => file.id));
+  const capturedSession = session.value, scoped = sessionRequests(client, capturedSession, () => session.value);
+  notice.value = '';
+  choosingDirectory.value = true;
+  try {
+    const directory = await directoryPicker.call(window, { mode: 'readwrite' });
+    scoped.assertCurrent();
+    const ready = files.value.filter(file => selected.has(file.id) && canBatchDownload(file));
+    for (const file of ready) newDownload(file, directory);
+    selectedFiles.value.clear();
+    if (ready.length < selected.size) notice.value = '部分文件状态已变化，请刷新列表后重试。';
+    schedule();
+  } catch (error) {
+    if (session.value === capturedSession && !(error instanceof DOMException && error.name === 'AbortError')) notice.value = human(error);
+  } finally { choosingDirectory.value = false; }
+}
+async function createBatchFile(directory: FileSystemDirectoryHandle, name: string, assertCurrent: () => void) {
+  const dot = name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const extension = dot > 0 ? name.slice(dot) : '';
+  for (let number = 1; ; number++) {
+    const candidate = number === 1 ? name : `${stem} (${number})${extension}`;
+    const reservation = candidate.normalize('NFC').toLowerCase();
+    if (reservingBatchNames.has(reservation)) continue;
+    reservingBatchNames.add(reservation);
+    try {
+      await directory.getFileHandle(candidate);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotFoundError') {
+        assertCurrent();
+        return await directory.getFileHandle(candidate, { create: true });
+      }
+      if (!(error instanceof DOMException && error.name === 'TypeMismatchError')) throw error;
+    } finally { reservingBatchNames.delete(reservation); }
+  }
+}
+function resumeDownload(task: Task) {
+  if (!task.directory) { void download(task.row!); return; }
+  task.paused = false;
+  task.status = '等待传输';
+  schedule();
+}
 async function download(row: Row) {
   if (!user.value || active.value >= 3) { notice.value = '当前已有三个任务运行，请稍后重试'; return; }
   if (downloadPreparing(row)) return;
-  if (visibleTasks.value.some(t => t.running && t.kind === 'download' && t.row && downloadReference(t.row as { id: string; deliveryId?: string }) === downloadReference(row as { id: string; deliveryId?: string }))) { notice.value = '此文件已在下载中'; return; }
-  const account = user.value.name, cacheKey = `download:${account}:${downloadReference(row as { id: string; deliveryId?: string })}`;
+  const existing = unfinishedDownload(row);
+  if (existing && (existing.running || !existing.paused)) { notice.value = '此文件已在下载队列中'; return; }
+  if (existing?.directory) { resumeDownload(existing); return; }
+  const cacheKey = `download:${user.value.name}:${downloadKey(row)}`;
   const capturedSession = session.value, scoped = sessionRequests(client, capturedSession, () => session.value);
-  const preparationKey = `${capturedSession}:${downloadReference(row as { id: string; deliveryId?: string })}`; preparingDownloads.value.add(preparationKey);
-  let handle: FileSystemFileHandle | undefined, saved: { handle: FileSystemFileHandle; offset: number } | undefined;
+  const preparationKey = `${capturedSession}:${downloadKey(row)}`; preparingDownloads.value.add(preparationKey);
+  let handle: FileSystemFileHandle | undefined, saved: SavedDownload | undefined;
   try {
-    saved = await localGet<{ handle: FileSystemFileHandle; offset: number }>(cacheKey);
+    saved = await localGet<SavedDownload>(cacheKey);
     scoped.assertCurrent();
     if (saved) { const permission = await (saved.handle as any).requestPermission({ mode: 'readwrite' }); if (permission === 'granted') handle = saved.handle; }
     if (!handle && 'showSaveFilePicker' in window) handle = await (window as any).showSaveFilePicker({ suggestedName: row.name });
     if (!handle && row.size > 32 * 1024 ** 2) throw new Error('大文件与断点下载请使用桌面版 Edge / Chrome');
     scoped.assertCurrent(); if (active.value >= 3) throw new Error('当前已有三个任务运行，请稍后重试');
-    if (visibleTasks.value.some(t => t.running && t.kind === 'download' && t.row && downloadReference(t.row as { id: string; deliveryId?: string }) === downloadReference(row as { id: string; deliveryId?: string }))) throw new Error('此文件已在下载中');
+    if (unfinishedDownload(row) !== existing) throw new Error('此文件已在下载队列中');
   } catch (e) { if (session.value === capturedSession && !(e instanceof DOMException && e.name === 'AbortError')) notice.value = human(e); return; }
   finally { preparingDownloads.value.delete(preparationKey); }
-  const pausedTask = visibleTasks.value.find(t => t.kind === 'download' && t.row && downloadReference(t.row as { id: string; deliveryId?: string }) === downloadReference(row as { id: string; deliveryId?: string }) && t.paused && !t.running);
-  if (pausedTask) Object.assign(pausedTask, { done: 0, paused: false, running: true, error: '', status: '正在下载' });
-  else tasks.value.push({ key: crypto.randomUUID(), owner: account, name: row.name, kind: 'download', total: row.size, done: 0, paused: false, running: true, row, status: '正在下载' });
-  const t = pausedTask ?? tasks.value[tasks.value.length - 1];
+  await runDownload(existing ?? newDownload(row), handle, saved);
+}
+async function runDownload(t: Task, handle = t.batchFile?.handle, saved = t.batchFile) {
+  const row = t.row!;
+  const scoped = sessionRequests(client, session.value, () => session.value);
+  const cacheKey = `download:${t.owner}:${downloadKey(row)}`;
+  Object.assign(t, { done: 0, paused: false, running: true, error: '', status: '正在下载' });
   let writer: FileSystemWritableFileStream | undefined; const hash = sha256.create(), parts: BlobPart[] = []; let committed = 0;
   try {
     if (handle && saved && handle === saved.handle) {
       const local = await handle.getFile(); t.done = Math.min(saved.offset, local.size, row.size);
       for (let i = 0; i < t.done; i += CHUNK) hash.update(new Uint8Array(await local.slice(i, Math.min(i + CHUNK, t.done)).arrayBuffer()));
     }
-    await scoped.rpc('download.init', { ...downloadAccess(row as { id: string; deliveryId?: string }), offset: t.done, prefixHash: hex(hash.clone().digest()) });
+    const info = await scoped.rpc('download.init', { ...downloadAccess(row as { id: string; deliveryId?: string }), offset: t.done, prefixHash: hex(hash.clone().digest()) });
+    if (info.meta.id !== row.id || info.meta.size !== row.size || info.meta.sha256 !== row.sha256) throw new Error('HASH_MISMATCH');
+    if (t.paused) return;
+    if (!handle && t.directory) {
+      handle = await createBatchFile(t.directory, row.name, scoped.assertCurrent);
+      t.batchFile = { handle, offset: 0 };
+      scoped.assertCurrent();
+    }
     if (handle) { writer = await handle.createWritable({ keepExistingData: true }); await writer.truncate(t.done); await writer.seek(t.done); committed = t.done; }
     while (t.done < row.size && !t.paused) {
       const r = await scoped.rpc('download.chunk', { ...downloadAccess(row as { id: string; deliveryId?: string }), offset: t.done });
-      if (r.meta.offset !== t.done || r.payload.length === 0 || r.meta.next !== t.done + r.payload.length) throw new Error('下载偏移校验失败');
+      const next = t.done + r.payload.length;
+      if (r.meta.offset !== t.done || r.payload.length === 0 || next > t.total || r.meta.next !== next || r.meta.eof !== (next === t.total)) throw new Error('下载偏移校验失败');
       hash.update(r.payload); if (writer) await writer.write(new Uint8Array(r.payload).buffer); else parts.push(new Uint8Array(r.payload).buffer);
       t.done += r.payload.length;
-      if (handle && writer && t.done - committed >= 4 * 1024 ** 2) { await writer.close(); writer = undefined; committed = t.done; await localPut(cacheKey, { handle, offset: committed }); writer = await handle.createWritable({ keepExistingData: true }); await writer.seek(t.done); }
+      if (handle && writer && t.done - committed >= 4 * 1024 ** 2) { await writer.close(); writer = undefined; committed = t.done; if (t.batchFile) t.batchFile.offset = committed; await localPut(cacheKey, { handle, offset: committed }); writer = await handle.createWritable({ keepExistingData: true }); await writer.seek(t.done); }
     }
     if (!t.paused && hex(hash.digest()) !== row.sha256) throw new Error('HASH_MISMATCH');
-    if (writer) { await writer.close(); writer = undefined; committed = t.done; await localPut(cacheKey, t.paused ? { handle, offset: committed } : undefined); }
+    if (writer) { await writer.close(); writer = undefined; committed = t.done; if (t.batchFile) t.batchFile.offset = committed; await localPut(cacheKey, t.paused ? { handle, offset: committed } : undefined); }
     if (!t.paused) {
       if (!handle) { const url = URL.createObjectURL(new Blob(parts)); const a = document.createElement('a'); a.href = url; a.download = row.name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); }
       t.status = '已完成';
+      t.batchFile = undefined;
+      t.directory = undefined;
     }
   } catch (e) {
     t.error = human(e); t.paused = true;
     if (e instanceof Error && ['NOT_FOUND', 'FILE_DELETING', 'DELIVERY_UNAVAILABLE', 'DELIVERY_EXPIRED'].includes(e.message)) { t.terminal = row.deliveryId ? e.message === 'DELIVERY_EXPIRED' ? '接收授权已到期' : '接收授权已失效' : e.message === 'NOT_FOUND' ? '源文件已删除' : '源文件待删除'; await localPut(cacheKey, undefined); }
     if (e instanceof Error && ['PREFIX_MISMATCH', 'HASH_MISMATCH'].includes(e.message)) {
+      if (t.batchFile) t.batchFile.offset = 0;
       await localPut(cacheKey, undefined);
       if (writer) { await writer.abort().catch(() => {}); writer = undefined; }
     }
@@ -248,13 +345,13 @@ onUnmounted(() => { clearInterval(poll); clearInterval(heartbeat); client.stop()
     <template v-if="tab === 'files'"><div class="stats"><article><span>已用空间</span><strong>{{ usage ? size(usage.used) : '—' }}</strong><p>已完成文件，含删除待重试的占用</p></article><article><span>上传预留空间</span><strong>{{ usage ? size(usage.reserved) : '—' }}</strong><p>未完成上传按完整文件大小预留</p></article><article><span>可用空间</span><strong>{{ usage ? size(usage.available) : '—' }}</strong><p>账号配额减去已用与预留空间</p></article></div><div class="quota-summary"><span>账号配额 {{ usage ? size(usage.limit) : '—' }}</span><span>我的文件 {{ usage?.fileCount ?? '—' }} 个</span><span>未完成上传 {{ usage?.transferCount ?? '—' }} 个</span><span>传输上限 {{ size(user.rate) }}/s · 双向及多会话共享</span></div><p v-if="usage?.overQuota" class="form-error">当前占用超过账号配额，请删除文件或取消未完成上传后再上传。</p>
 
     <section class="upload-zone" @dragover.prevent @drop.prevent="enqueue($event.dataTransfer?.files ?? null)"><div class="upload-icon">↑</div><div><h3>将文件拖到这里，开始安全传输</h3><p>支持多任务与断点续传 · 单文件最大 512 MB</p></div><button class="primary" @click="uploading?.click()">＋ 选择文件</button><input ref="uploading" hidden type="file" multiple @change="enqueue(($event.target as HTMLInputElement).files)"></section>
-    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"></div><p class="report-meta">上传完成后自动进行本地安全扫描，通过后才可下载或发送。旧文件需要请求扫描；隔离或失败不会自动删除文件，也不会释放占用。</p><div class="table-scroll"><table><thead><tr><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性与扫描</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span><ScanBadge :scan="f.scan" /></td><td class="file-buttons"><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean' || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean'" @click="sending = f; fileAction = undefined">发送给用户</button><button class="link" :disabled="f.deleting || ['pending','scanning'].includes(f.scan?.state)" @click="scanFile(f)">{{ f.scan?.state === 'clean' ? '重新扫描' : f.scan?.state === 'error' || f.scan?.state === 'quarantined' ? '重试扫描' : '请求扫描' }}</button><button class="link" :disabled="f.deleting || f.scan?.state === 'scanning'" @click="sending = undefined; fileAction = { file: f, mode: 'rename' }">重命名</button><button class="link danger" @click="sending = undefined; fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td colspan="5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
+    <section class="card"><div class="card-heading"><h3>我的文件 <span class="count">{{ files.length }}</span></h3><div class="file-tools"><input v-model="search" class="search" placeholder="搜索文件名" aria-label="搜索文件"><button v-if="directoryPicker" type="button" class="secondary" :disabled="!selectedBatchFiles.length || choosingDirectory" @click="batchDownload">{{ choosingDirectory ? '等待选择目录…' : selectedBatchFiles.length ? `批量下载 (${selectedBatchFiles.length})` : '批量下载' }}</button></div></div><p class="report-meta">上传完成后自动进行本地安全扫描，通过后才可下载或发送。旧文件需要请求扫描；隔离或失败不会自动删除文件，也不会释放占用。</p><div class="table-scroll"><table><thead><tr><th v-if="directoryPicker" class="file-select"><input type="checkbox" aria-label="选择当前列表中可批量下载的文件" :checked="batchFiles.length > 0 && selectedBatchFiles.length === batchFiles.length" :indeterminate="selectedBatchFiles.length > 0 && selectedBatchFiles.length < batchFiles.length" :disabled="!batchFiles.length || choosingDirectory" @change="selectBatchFiles(($event.target as HTMLInputElement).checked)"></th><th>文件名称</th><th>大小</th><th>上传时间</th><th>完整性与扫描</th><th></th></tr></thead><tbody><tr v-for="f in list" :key="f.id"><td v-if="directoryPicker" class="file-select"><input type="checkbox" :checked="selectedFiles.has(f.id)" @change="($event.target as HTMLInputElement).checked ? selectedFiles.add(f.id) : selectedFiles.delete(f.id)" :aria-label="`选择 ${f.name}`" :disabled="choosingDirectory || !canBatchDownload(f)"></td><td><div class="file-name"><span class="file-icon">▤</span><div><strong>{{ f.name }}</strong><small :title="f.sha256">{{ f.sha256.slice(0, 20) }}…</small></div></div></td><td>{{ size(f.size) }}</td><td>{{ time(f.created) }}</td><td><span :class="f.deleting ? 'badge red' : 'badge'">{{ f.deleting ? '删除待重试' : '✓ SHA-256' }}</span><ScanBadge :scan="f.scan" /></td><td class="file-buttons"><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean' || downloadPreparing(f)" @click="download(f)">{{ downloadPreparing(f) ? '等待文件授权…' : '下载 / 续传 ↓' }}</button><button class="link" :disabled="f.deleting || f.scan?.state !== 'clean'" @click="sending = f; fileAction = undefined">发送给用户</button><button class="link" :disabled="f.deleting || ['pending','scanning'].includes(f.scan?.state)" @click="scanFile(f)">{{ f.scan?.state === 'clean' ? '重新扫描' : f.scan?.state === 'error' || f.scan?.state === 'quarantined' ? '重试扫描' : '请求扫描' }}</button><button class="link" :disabled="f.deleting || f.scan?.state === 'scanning'" @click="sending = undefined; fileAction = { file: f, mode: 'rename' }">重命名</button><button class="link danger" @click="sending = undefined; fileAction = { file: f, mode: 'delete' }">{{ f.deleting ? '重试删除' : '删除' }}</button></td></tr><tr v-if="!list.length"><td :colspan="directoryPicker ? 6 : 5" class="empty">{{ search ? '没有匹配的文件' : '空间已准备就绪，上传第一个文件吧。' }}</td></tr></tbody></table></div></section>
     <SendFile v-if="sending" :key="sending.id" :file="sending" :rpc="accountRpc" @close="sending = undefined" />
     <FileAction v-if="fileAction" :key="fileAction.file.id + fileAction.mode" :file="fileAction.file" :mode="fileAction.mode" :rpc="accountRpc" @close="fileAction = undefined" @changed="fileChanged" @refresh="attempt(refresh)" />
 
     <section v-if="transfers.length" class="card"><div class="card-heading"><h3>服务端未完成上传</h3><span class="muted">取消待重试的任务仍占用预留空间</span></div><div v-for="t in transfers" :key="t.id" class="pending-row"><span>{{ t.name }}</span><small>{{ t.deleting ? '取消待重试 · ' : '' }}{{ size(t.offset) }} / {{ size(t.size) }}</small><button class="link danger" @click="cancelPending(t)">{{ t.deleting ? '重试取消清理' : '取消并清理上传' }}</button></div></section><p class="footnote">断点下载建议使用桌面版 Edge / Chrome；每 4 MB 保存检查点，暂停时保存当前位置。其他浏览器支持 32 MB 以内的普通下载。</p>
     </template>
-    <section v-if="(tab === 'files' || tab === 'deliveries') && visibleTasks.length" class="card"><div class="card-heading"><h3>传输队列 <span class="count">{{ active }} 进行中</span></h3><span class="muted">最多同时运行 3 个任务</span></div><div v-for="t in visibleTasks" :key="t.key" class="task"><span class="transfer-symbol">{{ t.kind === 'upload' ? '↑' : '↓' }}</span><div class="task-body"><div class="task-title"><strong>{{ t.name }}</strong><span>{{ t.status }} · {{ percent(t) }}%</span></div><progress :value="progressValue(t)" :max="t.total || 1"></progress><small>{{ size(t.done) }} / {{ size(t.total) }}<span v-if="t.error" class="error-text"> · {{ t.error }}</span></small></div><button v-if="t.running" class="secondary small" @click="t.paused = true">暂停</button><button v-else-if="!t.terminal && t.paused && t.kind === 'upload'" class="secondary small" @click="t.paused = false; t.status = '等待传输'; schedule()">继续</button><button v-else-if="!t.terminal && t.paused && t.row" class="secondary small" :disabled="downloadPreparing(t.row)" @click="download(t.row)">{{ downloadPreparing(t.row) ? '等待文件授权…' : '恢复下载' }}</button><span v-else class="badge">{{ t.status }}</span></div></section>
+    <section v-if="(tab === 'files' || tab === 'deliveries') && visibleTasks.length" class="card"><div class="card-heading"><h3>传输队列 <span class="count">{{ active }} 进行中</span></h3><span class="muted">最多同时运行 3 个任务</span></div><div v-for="t in visibleTasks" :key="t.key" class="task"><span class="transfer-symbol">{{ t.kind === 'upload' ? '↑' : '↓' }}</span><div class="task-body"><div class="task-title"><strong>{{ t.name }}</strong><span>{{ t.status }} · {{ percent(t) }}%</span></div><progress :value="progressValue(t)" :max="t.total || 1"></progress><small>{{ size(t.done) }} / {{ size(t.total) }}<span v-if="t.error" class="error-text"> · {{ t.error }}</span></small></div><button v-if="t.running" class="secondary small" @click="t.paused = true">暂停</button><button v-else-if="!t.terminal && t.paused && t.kind === 'upload'" class="secondary small" @click="t.paused = false; t.status = '等待传输'; schedule()">继续</button><button v-else-if="!t.terminal && t.paused && t.row" class="secondary small" :disabled="downloadPreparing(t.row)" @click="resumeDownload(t)">{{ downloadPreparing(t.row) ? '等待文件授权…' : '恢复下载' }}</button><span v-else class="badge">{{ t.status }}</span></div></section>
     <MfaSettings v-if="tab === 'security' && user.role === 'admin'" :key="session" :rpc="accountRpc" @changed="mfaChanged" />
     <template v-if="tab === 'security' && !user.recoveryOnly"><div class="stats"><article><span>在线会话</span><strong>{{ sessions.length }}</strong><p>可即时撤销指定会话</p></article><article><span>最近拒绝事件</span><strong>{{ denied }}</strong><p>基于当前可见的最近事件</p></article><article><span>已绑定公钥</span><strong>{{ keys.length }}</strong><p>标准 P-256 挑战签名</p></article></div><SecurityEvents ref="securityEvents" :rpc="accountRpc" :admin="user.role === 'admin'" /><section class="card"><div class="card-heading"><h3>在线会话</h3><span class="muted">仅管理自己的会话</span></div><div v-for="s in sessions" :key="s.id" class="session-row"><span class="session-icon">▣</span><div><strong>{{ s.agent.slice(0, 72) }}</strong><small>{{ s.ip }} · {{ time(s.created) }}</small></div><span v-if="s.id === session" class="badge">当前会话</span><button class="secondary small" @click="revoke(s.id)">{{ s.id === session ? '退出本会话' : '撤销会话' }}</button></div></section><section class="card"><div class="card-heading"><h3>修改口令</h3><span class="muted">修改后全部会话与已绑定公钥失效</span></div><form class="account-content password-form" @submit.prevent="changePassword"><div v-if="passwordError" ref="passwordFeedback" class="form-error" role="alert" tabindex="-1"><strong>口令未修改</strong><p>{{ passwordError }}</p></div><p class="muted">包括当前会话在内的传输将停止，文件和续传任务保留。请重新登录，并按需重新绑定公钥。</p><label>当前口令<input v-model="currentPassword" type="password" autocomplete="current-password" maxlength="256" required></label><label>新口令<input v-model="newPassword" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="12～256 个字符" required></label><label>确认新口令<input v-model="confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label><button class="primary" :disabled="changing">{{ changing ? '正在修改…' : '修改口令并退出全部会话' }}</button></form></section><section class="card"><div class="card-heading"><h3>公钥身份管理</h3><span class="muted">私钥留在浏览器内，不可导出</span></div><p v-if="user.mfaEnabled" class="account-content muted">已开启管理员双因素认证，请使用口令加验证码登录；本机公钥绑定已停用。</p><div class="key-form"><label>绑定或撤销前，请重新验证口令<input v-model="reauth" type="password" autocomplete="current-password" placeholder="输入当前账号口令"></label><button class="primary" :disabled="!reauth || user.mfaEnabled" @click="enroll">绑定本机公钥</button></div><div v-for="k in keys" :key="k.id" class="pending-row"><span>{{ k.label }}</span><small>{{ time(k.created) }}</small><button class="link danger" :disabled="!reauth" @click="revokeKey(k.id)">撤销公钥</button></div></section></template>
     <DeliveryCenter v-if="tab === 'deliveries'" ref="deliveryCenter" :key="session" :rpc="accountRpc" :download="download" :preparing="downloadPreparing" />

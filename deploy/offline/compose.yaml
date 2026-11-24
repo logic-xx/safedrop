@@ -1,7 +1,7 @@
 name: safedrop-offline-prepared
 services:
   app:
-    image: safedrop-offline-app:0.1.0-prepared
+    image: "${SAFEDROP_APP_IMAGE:-safedrop-offline-app:0.1.0-prepared}"
     platform: linux/amd64
     pull_policy: never
     environment:
@@ -26,7 +26,7 @@ services:
       retries: 12
     restart: unless-stopped
   scanner:
-    image: safedrop-offline-scanner:0.1.0-prepared
+    image: "${SAFEDROP_SCANNER_IMAGE:-safedrop-offline-scanner:0.1.0-prepared}"
     platform: linux/amd64
     pull_policy: never
     read_only: true
@@ -38,7 +38,9 @@ services:
     cpus: 1.5
     init: true
     tmpfs: ["/tmp:size=1536m,noexec,nosuid,uid=65532,gid=65532,mode=0700"]
-    networks: [backend]
+    volumes:
+      - scanner_data:/data
+    networks: [backend, signatures]
     healthcheck:
       test: [CMD, /nodejs/bin/node, /scanner/health.mjs]
       interval: 5s
@@ -48,7 +50,7 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
   gateway:
-    image: safedrop-offline-gateway:0.1.0-prepared
+    image: "${SAFEDROP_GATEWAY_IMAGE:-safedrop-offline-gateway:0.1.0-prepared}"
     platform: linux/amd64
     pull_policy: never
     ports: ["127.0.0.1:${SAFEDROP_OFFLINE_PORT:-8443}:8443"]
@@ -69,7 +71,9 @@ services:
 networks:
   backend: { internal: true }
   edge: {}
+  signatures: {}
 volumes:
   app_data:
   caddy_data:
   caddy_config:
+  scanner_data:
