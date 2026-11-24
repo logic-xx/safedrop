@@ -18,8 +18,11 @@ import type { ScanEngine } from './clamd.ts';
 import { queryEvents, recentEvents } from './events.ts';
 
 export interface Config { root: string; origin: string; tls?: { cert: Buffer; key: Buffer }; webRoot?: string; reportPath?: string; maxFile?: number; quota?: number; normalRate?: number; vipRate?: number; sessionMs?: number; loginLimit?: number; storage?: StoragePolicy; mfaKeyFile?: string; mfaClock?: () => number; backupKeyFile?: string; scanner?: ScanEngine; scanMaxAgeMs?: number; scanClock?: () => number; deliveryClock?: () => number }
-interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
+type SaveMode = 'file' | 'browser';
+interface DownloadReceipt { fileId: string; deliveryId?: string; size: number; sha256: string; next: number; completed?: SaveMode }
+interface Context { ws: WebSocket; connection: string; ip: string; agent: string; session?: string; user?: Row; abort: AbortController; pending: number; alive: boolean; startedDownloads: Set<string>; downloadReceipts: Map<string, DownloadReceipt>; challenge?: { key: Row; message: string; expires: number }; mfaLogin?: { userId: string; authVersion: number; id: string; expires: number; attempts: number }; mfaSetup?: { secret: Buffer; expires: number; authVersion: number } }
 const MAX_FOLDERS = 32; // Keep the account's folder list within one SFT/1 frame.
+const MAX_DOWNLOAD_RECEIPTS = 32;
 function filename(value: unknown) {
   const name = text(value); need(!/[\\/\x00-\x1f\x7f:]/.test(name) && !['.', '..'].includes(name) && name.trim().length > 0, 'INVALID_FILENAME'); return name;
 }
@@ -587,17 +590,53 @@ export function createApp(config: Config) {
         if (offset) { need(hashing < 4, 'SERVER_BUSY'); hashing++; try { need(await hashFile(join(config.root, 'objects', file.id), offset, signal) === m.prefixHash, 'PREFIX_MISMATCH'); } finally { hashing--; } }
         const access = readable(c, file.id, m.deliveryId); downloadStarted(c, access, offset, true);
         if (!access.delivery) audit(c, op, 'allowed', { fileId: file.id, offset });
-        return { meta: { id: file.id, name: access.file.name, size: file.size, sha256: file.sha256, created: file.created } };
+        const meta: Row = { id: file.id, name: access.file.name, size: file.size, sha256: file.sha256, created: file.created };
+        if (m.receipt === true) {
+          if (c.downloadReceipts.size >= MAX_DOWNLOAD_RECEIPTS) c.downloadReceipts.delete(c.downloadReceipts.keys().next().value!);
+          const downloadId = id();
+          c.downloadReceipts.set(downloadId, { fileId: file.id, deliveryId: access.delivery?.id, size: file.size, sha256: file.sha256, next: offset });
+          meta.downloadId = downloadId;
+        }
+        return { meta };
       });
     }
     if (op === 'download.chunk') {
       const { file } = readable(c, m.fileId, m.deliveryId), offset = integer(m.offset, file.size), length = Math.min(CHUNK, file.size - offset);
+      const next = offset + length;
+      let receipt: DownloadReceipt | undefined;
+      if (m.downloadId !== undefined) {
+        receipt = c.downloadReceipts.get(text(m.downloadId, 80));
+        need(receipt && receipt.fileId === file.id && receipt.deliveryId === m.deliveryId &&
+          receipt.size === file.size && receipt.sha256 === file.sha256 && !receipt.completed, 'DOWNLOAD_RECEIPT_INVALID');
+        need(offset === receipt.next || next <= receipt.next, 'INVALID_OFFSET');
+      }
       return downloading(c, file.id, m.deliveryId, async signal => {
         await bw.take(u.id, u.tier, length, signal); readable(c, file.id, m.deliveryId);
         const h = await open(join(config.root, 'objects', file.id), 'r'), out = Buffer.alloc(length);
         try { signal.throwIfAborted(); readable(c, file.id, m.deliveryId); const { bytesRead } = await h.read(out, 0, length, offset); need(bytesRead === length, 'READ_FAILED'); } finally { await h.close(); }
-        downloadStarted(c, readable(c, file.id, m.deliveryId), offset, false); return { meta: { offset, next: offset + length, eof: offset + length === file.size }, payload: out };
+        downloadStarted(c, readable(c, file.id, m.deliveryId), offset, false);
+        if (receipt) receipt.next = Math.max(receipt.next, next);
+        return { meta: { offset, next, eof: next === file.size }, payload: out };
       });
+    }
+    if (op === 'download.finish') {
+      const receipt = c.downloadReceipts.get(text(m.downloadId, 80));
+      need(receipt, 'DOWNLOAD_RECEIPT_INVALID');
+      const { file, delivery } = readable(c, receipt.fileId, receipt.deliveryId);
+      const saveMode = m.saveMode;
+      need(saveMode === 'file' || saveMode === 'browser', 'DOWNLOAD_RECEIPT_INVALID');
+      need(receipt.sha256 === file.sha256 && receipt.sha256 === m.sha256 &&
+        receipt.size === file.size && receipt.size === m.size, 'HASH_MISMATCH');
+      need(receipt.next === receipt.size, 'INCOMPLETE_FILE');
+      if (receipt.completed) {
+        need(receipt.completed === saveMode, 'DOWNLOAD_RECEIPT_INVALID');
+      } else {
+        const detail = { fileId: file.id, size: receipt.size, sha256: receipt.sha256, saveMode };
+        if (delivery) deliveryAudit(c, op, delivery, detail);
+        else audit(c, op, 'allowed', detail);
+        receipt.completed = saveMode;
+      }
+      return { meta: { received: true } };
     }
     if (op === 'sessions.list') return { meta: { sessions: store.all('SELECT id,created,expires,agent,ip FROM sessions WHERE userId=? AND revoked=0 AND expires>? ORDER BY created DESC', u.id, Date.now()), current: c.session } };
     if (op === 'sessions.revoke' || op === 'auth.logout') {
@@ -640,7 +679,7 @@ export function createApp(config: Config) {
     throw new Fault('UNKNOWN_OPERATION');
   }
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-    const c: Context = { ws, connection: id(), ip: req.socket.remoteAddress ?? 'unknown', agent: (req.headers['user-agent'] ?? 'unknown').slice(0, 160), abort: new AbortController(), pending: 0, alive: true, startedDownloads: new Set() };
+    const c: Context = { ws, connection: id(), ip: req.socket.remoteAddress ?? 'unknown', agent: (req.headers['user-agent'] ?? 'unknown').slice(0, 160), abort: new AbortController(), pending: 0, alive: true, startedDownloads: new Set(), downloadReceipts: new Map() };
     contexts.add(c); let queue = Promise.resolve();
     let authDeadline = setTimeout(function deadline() {
       if (!c.user) { if (c.mfaLogin && c.mfaLogin.expires > mfa.now()) authDeadline = setTimeout(deadline, c.mfaLogin.expires - mfa.now()); else ws.close(4003, 'AUTH_TIMEOUT'); }

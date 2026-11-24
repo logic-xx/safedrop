@@ -54,9 +54,10 @@ const selectedBatchFiles = computed(() => batchFiles.value.filter(file => select
 watch([search, session, folderId], () => selectedFiles.value.clear());
 const size = (n: number) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 const time = (n: number | string) => new Date(n).toLocaleString('zh-CN', { hour12: false });
-const percent = (t: Task) => t.total ? Math.floor(t.done / t.total * 100) : t.status === '已完成' ? 100 : 0;
-const progressValue = (t: Task) => t.total ? t.done : t.status === '已完成' ? 1 : 0;
-function pauseTasks() { for (const t of tasks.value) if (t.status !== '已完成') t.paused = true; }
+const transferComplete = (t: Task) => t.status === '已完成' || t.status === '已交给浏览器';
+const percent = (t: Task) => t.total ? Math.floor(t.done / t.total * 100) : transferComplete(t) ? 100 : 0;
+const progressValue = (t: Task) => t.total ? t.done : transferComplete(t) ? 1 : 0;
+function pauseTasks() { for (const t of tasks.value) if (!transferComplete(t)) t.paused = true; }
 client.onState = s => connection.value = s;
 function openFolder(next: string | null) {
   folderId.value = next;
@@ -193,7 +194,7 @@ async function fileChanged(mode: 'rename' | 'delete' | 'move', file: Row) {
   }
   for (const t of visibleTasks.value) if (t.kind === 'download' && t.row?.id === file.id) {
     if (mode === 'rename') { t.name = file.name; t.row = file; }
-    else if (t.status !== '已完成') { t.paused = true; t.terminal = t.status = '源文件已删除'; }
+    else if (!transferComplete(t)) { t.paused = true; t.terminal = t.status = '源文件已删除'; }
   }
   await attempt(refresh);
 }
@@ -205,7 +206,7 @@ const downloadKey = (row: Row) => downloadReference(row as { id: string; deliver
 const downloadPreparing = (row: Row) => preparingDownloads.value.has(`${session.value}:${downloadKey(row)}`);
 function unfinishedDownload(row: Row) {
   return visibleTasks.value.find(task => task.kind === 'download' && task.row && !task.terminal &&
-    task.status !== '已完成' && downloadKey(task.row) === downloadKey(row));
+    !transferComplete(task) && downloadKey(task.row) === downloadKey(row));
 }
 function canBatchDownload(row: Row) {
   return !row.deleting && row.scan?.state === 'clean' && !downloadPreparing(row) && !unfinishedDownload(row);
@@ -297,8 +298,10 @@ async function runDownload(t: Task, handle = t.batchFile?.handle, saved = t.batc
       const local = await handle.getFile(); t.done = Math.min(saved.offset, local.size, row.size);
       for (let i = 0; i < t.done; i += CHUNK) hash.update(new Uint8Array(await local.slice(i, Math.min(i + CHUNK, t.done)).arrayBuffer()));
     }
-    const info = await scoped.rpc('download.init', { ...downloadAccess(row as { id: string; deliveryId?: string }), offset: t.done, prefixHash: hex(hash.clone().digest()) });
+    const access = downloadAccess(row as { id: string; deliveryId?: string });
+    const info = await scoped.rpc('download.init', { ...access, offset: t.done, prefixHash: hex(hash.clone().digest()), receipt: true });
     if (info.meta.id !== row.id || info.meta.size !== row.size || info.meta.sha256 !== row.sha256) throw new Error('HASH_MISMATCH');
+    const downloadId = info.meta.downloadId;
     if (t.paused) return;
     if (!handle && t.directory) {
       handle = await createBatchFile(t.directory, row.name, scoped.assertCurrent);
@@ -307,7 +310,7 @@ async function runDownload(t: Task, handle = t.batchFile?.handle, saved = t.batc
     }
     if (handle) { writer = await handle.createWritable({ keepExistingData: true }); await writer.truncate(t.done); await writer.seek(t.done); committed = t.done; }
     while (t.done < row.size && !t.paused) {
-      const r = await scoped.rpc('download.chunk', { ...downloadAccess(row as { id: string; deliveryId?: string }), offset: t.done });
+      const r = await scoped.rpc('download.chunk', { ...access, offset: t.done, downloadId });
       const next = t.done + r.payload.length;
       if (r.meta.offset !== t.done || r.payload.length === 0 || next > t.total || r.meta.next !== next || r.meta.eof !== (next === t.total)) throw new Error('下载偏移校验失败');
       hash.update(r.payload); if (writer) await writer.write(new Uint8Array(r.payload).buffer); else parts.push(new Uint8Array(r.payload).buffer);
@@ -315,12 +318,29 @@ async function runDownload(t: Task, handle = t.batchFile?.handle, saved = t.batc
       if (handle && writer && t.done - committed >= 4 * 1024 ** 2) { await writer.close(); writer = undefined; committed = t.done; if (t.batchFile) t.batchFile.offset = committed; await localPut(cacheKey, { handle, offset: committed }); writer = await handle.createWritable({ keepExistingData: true }); await writer.seek(t.done); }
     }
     if (!t.paused && hex(hash.digest()) !== row.sha256) throw new Error('HASH_MISMATCH');
-    if (writer) { await writer.close(); writer = undefined; committed = t.done; if (t.batchFile) t.batchFile.offset = committed; await localPut(cacheKey, t.paused ? { handle, offset: committed } : undefined); }
+    if (writer) {
+      await writer.close();
+      writer = undefined; committed = t.done;
+      if (t.batchFile) t.batchFile.offset = committed;
+      if (t.paused) await localPut(cacheKey, { handle, offset: committed });
+    }
     if (!t.paused) {
+      scoped.assertCurrent();
       if (!handle) { const url = URL.createObjectURL(new Blob(parts)); const a = document.createElement('a'); a.href = url; a.download = row.name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); }
-      t.status = '已完成';
+      t.status = handle ? '已完成' : '已交给浏览器';
       t.batchFile = undefined;
       t.directory = undefined;
+      if (handle) await localPut(cacheKey, undefined).catch(() => {});
+      if (typeof downloadId === 'string') {
+        const receipt = { downloadId, sha256: row.sha256, size: row.size, saveMode: handle ? 'file' : 'browser' };
+        try {
+          try { await scoped.rpc('download.finish', receipt); }
+          catch (e) {
+            if (!(e instanceof Error && e.message === 'REQUEST_TIMEOUT')) throw e;
+            await scoped.rpc('download.finish', receipt);
+          }
+        } catch (e) { t.error = '下载回执未获确认 · ' + human(e); }
+      }
     }
   } catch (e) {
     t.error = human(e); t.paused = true;
@@ -374,7 +394,7 @@ onUnmounted(() => { clearInterval(poll); clearInterval(heartbeat); client.stop()
 
     <section v-if="transfers.length" class="card"><div class="card-heading"><h3>服务端未完成上传</h3><span class="muted">取消待重试的任务仍占用预留空间</span></div><div v-for="t in transfers" :key="t.id" class="pending-row"><span>{{ t.name }}</span><small>{{ t.deleting ? '取消待重试 · ' : '' }}{{ size(t.offset) }} / {{ size(t.size) }}</small><button class="link danger" @click="cancelPending(t)">{{ t.deleting ? '重试取消清理' : '取消并清理上传' }}</button></div></section><p class="footnote">断点下载建议使用桌面版 Edge / Chrome；每 4 MB 保存检查点，暂停时保存当前位置。其他浏览器支持 32 MB 以内的普通下载。</p>
     </template>
-    <section v-if="(tab === 'files' || tab === 'deliveries') && visibleTasks.length" class="card"><div class="card-heading"><h3>传输队列 <span class="count">{{ active }} 进行中</span></h3><span class="muted">最多同时运行 3 个任务</span></div><div v-for="t in visibleTasks" :key="t.key" class="task"><span class="transfer-symbol">{{ t.kind === 'upload' ? '↑' : '↓' }}</span><div class="task-body"><div class="task-title"><strong>{{ t.name }}</strong><span>{{ t.status }} · {{ percent(t) }}%</span></div><progress :value="progressValue(t)" :max="t.total || 1"></progress><small>{{ size(t.done) }} / {{ size(t.total) }}<span v-if="t.error" class="error-text"> · {{ t.error }}</span></small></div><button v-if="t.running" class="secondary small" @click="t.paused = true">暂停</button><button v-else-if="!t.terminal && t.paused && t.kind === 'upload'" class="secondary small" @click="t.paused = false; t.status = '等待传输'; schedule()">继续</button><button v-else-if="!t.terminal && t.paused && t.row" class="secondary small" :disabled="downloadPreparing(t.row)" @click="resumeDownload(t)">{{ downloadPreparing(t.row) ? '等待文件授权…' : '恢复下载' }}</button><span v-else class="badge">{{ t.status }}</span></div></section>
+    <section v-if="(tab === 'files' || tab === 'deliveries') && visibleTasks.length" class="card"><div class="card-heading"><h3>传输队列 <span class="count">{{ active }} 进行中</span></h3><span class="muted">最多同时运行 3 个任务</span></div><div v-for="t in visibleTasks" :key="t.key" class="task"><span class="transfer-symbol">{{ t.kind === 'upload' ? '↑' : '↓' }}</span><div class="task-body"><div class="task-title"><strong>{{ t.name }}</strong><span>{{ t.status }} · {{ percent(t) }}%</span></div><progress :value="progressValue(t)" :max="t.total || 1"></progress><small>{{ size(t.done) }} / {{ size(t.total) }}<span v-if="t.error" class="error-text"> · {{ t.error }}</span></small></div><button v-if="t.running && !transferComplete(t)" class="secondary small" @click="t.paused = true">暂停</button><button v-else-if="!t.terminal && t.paused && t.kind === 'upload'" class="secondary small" @click="t.paused = false; t.status = '等待传输'; schedule()">继续</button><button v-else-if="!t.terminal && t.paused && t.row" class="secondary small" :disabled="downloadPreparing(t.row)" @click="resumeDownload(t)">{{ downloadPreparing(t.row) ? '等待文件授权…' : '恢复下载' }}</button><span v-else class="badge">{{ t.status }}</span></div></section>
     <MfaSettings v-if="tab === 'security' && user.role === 'admin'" :key="session" :rpc="accountRpc" @changed="mfaChanged" />
     <template v-if="tab === 'security' && !user.recoveryOnly"><div class="stats"><article><span>在线会话</span><strong>{{ sessions.length }}</strong><p>可即时撤销指定会话</p></article><article><span>最近拒绝事件</span><strong>{{ denied }}</strong><p>基于当前可见的最近事件</p></article><article><span>已绑定公钥</span><strong>{{ keys.length }}</strong><p>标准 P-256 挑战签名</p></article></div><SecurityEvents ref="securityEvents" :rpc="accountRpc" :admin="user.role === 'admin'" /><section class="card"><div class="card-heading"><h3>在线会话</h3><span class="muted">仅管理自己的会话</span></div><div v-for="s in sessions" :key="s.id" class="session-row"><span class="session-icon">▣</span><div><strong>{{ s.agent.slice(0, 72) }}</strong><small>{{ s.ip }} · {{ time(s.created) }}</small></div><span v-if="s.id === session" class="badge">当前会话</span><button class="secondary small" @click="revoke(s.id)">{{ s.id === session ? '退出本会话' : '撤销会话' }}</button></div></section><section class="card"><div class="card-heading"><h3>修改口令</h3><span class="muted">修改后全部会话与已绑定公钥失效</span></div><form class="account-content password-form" @submit.prevent="changePassword"><div v-if="passwordError" ref="passwordFeedback" class="form-error" role="alert" tabindex="-1"><strong>口令未修改</strong><p>{{ passwordError }}</p></div><p class="muted">包括当前会话在内的传输将停止，文件和续传任务保留。请重新登录，并按需重新绑定公钥。</p><label>当前口令<input v-model="currentPassword" type="password" autocomplete="current-password" maxlength="256" required></label><label>新口令<input v-model="newPassword" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="12～256 个字符" required></label><label>确认新口令<input v-model="confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="256" required></label><button class="primary" :disabled="changing">{{ changing ? '正在修改…' : '修改口令并退出全部会话' }}</button></form></section><section class="card"><div class="card-heading"><h3>公钥身份管理</h3><span class="muted">私钥留在浏览器内，不可导出</span></div><p v-if="user.mfaEnabled" class="account-content muted">已开启管理员双因素认证，请使用口令加验证码登录；本机公钥绑定已停用。</p><div class="key-form"><label>绑定或撤销前，请重新验证口令<input v-model="reauth" type="password" autocomplete="current-password" placeholder="输入当前账号口令"></label><button class="primary" :disabled="!reauth || user.mfaEnabled" @click="enroll">绑定本机公钥</button></div><div v-for="k in keys" :key="k.id" class="pending-row"><span>{{ k.label }}</span><small>{{ time(k.created) }}</small><button class="link danger" :disabled="!reauth" @click="revokeKey(k.id)">撤销公钥</button></div></section></template>
     <DeliveryCenter v-if="tab === 'deliveries'" ref="deliveryCenter" :key="session" :rpc="accountRpc" :download="download" :preparing="downloadPreparing" />

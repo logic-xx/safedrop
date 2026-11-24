@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdtemp, readFile, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:https';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { WebSocket } from 'ws';
 import { CHUNK, decode, encode } from '../shared/protocol.ts';
@@ -108,12 +111,15 @@ export async function probeOfflineImages({ origin, ca, password, stale = false }
     assert.equal(moved.folderId, folder.id);
     assert.equal(moved.scan.state, 'clean');
     assert.equal(moved.sha256, hash);
-    const info = (await rpc('download.init', { fileId })).meta;
+    const info = (await rpc('download.init', { fileId, receipt: true })).meta;
     assert.equal(info.size, bytes.length);
     assert.equal(info.sha256, hash);
+    assert.equal(typeof info.downloadId, 'string');
+    const receipt = { downloadId: info.downloadId, size: bytes.length, sha256: hash, saveMode: 'file' };
+    await assert.rejects(rpc('download.finish', receipt), { message: 'download.finish: INCOMPLETE_FILE' });
     const parts = [];
     for (let offset = 0; offset < bytes.length; offset += CHUNK) {
-      const reply = await rpc('download.chunk', { fileId, offset });
+      const reply = await rpc('download.chunk', { fileId, offset, downloadId: info.downloadId });
       const next = Math.min(offset + CHUNK, bytes.length);
       assert.equal(reply.meta.offset, offset);
       assert.equal(reply.meta.next, next);
@@ -123,10 +129,25 @@ export async function probeOfflineImages({ origin, ca, password, stale = false }
     const downloaded = Buffer.concat(parts);
     assert.deepEqual(downloaded, bytes);
     assert.equal(sha256(downloaded), hash);
+    const downloadDirectory = await mkdtemp(join(tmpdir(), 'safedrop-download-'));
+    const savedPath = join(downloadDirectory, 'offline-verification.txt');
+    try {
+      await writeFile(savedPath, downloaded, { flag: 'wx' });
+      assert.equal(sha256(await readFile(savedPath)), hash);
+      for (let attempt = 0; attempt < 2; attempt++) assert.equal((await rpc('download.finish', receipt)).meta.received, true);
+    } finally {
+      await unlink(savedPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      await rmdir(downloadDirectory);
+    }
+    const events = (await rpc('events.list')).meta.events.filter(event =>
+      event.action === 'download.finish' && event.result === 'allowed' && event.detail.fileId === fileId);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].detail.saveMode, 'file');
+    assert.equal(events[0].detail.sha256, hash);
     assert.equal((await rpc('files.move', { fileId, folderId: null })).meta.folderId, null);
     assert.equal((await rpc('files.list')).meta.files.find(file => file.id === fileId).folderId, null);
     await rpc('auth.logout');
-    return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: 'clean', engine: scan.engine, downloadedBytes: downloaded.length, sha256: hash, folderMove: 'into-folder-and-back' };
+    return { https: 200, wss: 'SFT/1', uploadedBytes: bytes.length, scan: 'clean', engine: scan.engine, downloadedBytes: downloaded.length, sha256: hash, folderMove: 'into-folder-and-back', receipt: { replayAcknowledged: true, auditRecords: events.length, localSha256Matched: true } };
   } finally {
     ws.terminate();
   }

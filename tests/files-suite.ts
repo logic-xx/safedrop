@@ -103,6 +103,39 @@ export async function runFileSuite(onResult?: (r: Result) => void) {
     assert.equal(f.app.store.get('SELECT folderId FROM file_folders WHERE fileId=?', fileId), undefined);
     assert.deepEqual(await owner.rpc('folders.list').then(r => r.meta.folders), [created]);
   }, '文件夹与文件均按本人授权。移动保留对象、扫描结果、续传前缀和接收授权，重启后保留归属，删除文件清理归属关系。');
+  await run('下载回执：验证完整性、连接归属和幂等，交付双方可查看', async f => {
+    const bytes = randomBytes(CHUNK + 17);
+    const fileId = await f.upload(bytes);
+    await scanFixtureFile(f.app, fileId);
+    const deliveryId = (await f.owner.rpc('deliveries.create', { fileId, recipient: 'other' })).meta.deliveryId;
+    const access = { fileId, deliveryId };
+    const start = (offset = 0) => f.other.rpc('download.init', { ...access, receipt: true, offset, prefixHash: digest(bytes.subarray(0, offset)) });
+    const downloadId = (await start()).meta.downloadId;
+    const receipt = { downloadId, sha256: digest(bytes), size: bytes.length, saveMode: 'file' };
+    await assert.rejects(f.other.rpc('download.finish', receipt), /INCOMPLETE_FILE/);
+    await assert.rejects(f.other.rpc('download.chunk', { ...access, downloadId, offset: CHUNK }), /INVALID_OFFSET/);
+    await assert.rejects(f.owner.rpc('download.finish', receipt), /DOWNLOAD_RECEIPT_INVALID/);
+    const secondConnection = await f.login('other');
+    await assert.rejects(secondConnection.rpc('download.finish', receipt), /DOWNLOAD_RECEIPT_INVALID/);
+    for (const offset of [0, 0, CHUNK]) {
+      const chunk = await f.other.rpc('download.chunk', { ...access, downloadId, offset });
+      assert.deepEqual(Buffer.from(chunk.payload), bytes.subarray(offset, offset + CHUNK));
+    }
+    await assert.rejects(f.other.rpc('download.finish', { ...receipt, sha256: digest('wrong') }), /HASH_MISMATCH/);
+    for (let attempt = 0; attempt < 2; attempt++) assert.equal((await f.other.rpc('download.finish', receipt)).meta.received, true);
+    await assert.rejects(f.other.rpc('download.finish', { ...receipt, saveMode: 'browser' }), /DOWNLOAD_RECEIPT_INVALID/);
+    const resumed = (await start(CHUNK)).meta.downloadId;
+    await f.other.rpc('download.chunk', { ...access, downloadId: resumed, offset: CHUNK });
+    assert.equal((await f.other.rpc('download.finish', { ...receipt, downloadId: resumed, saveMode: 'browser' })).meta.received, true);
+    const audit = async (peer: Peer) => ((await peer.rpc('events.list')).meta.events as Record<string, any>[])
+      .filter(event => event.action === 'download.finish' && event.result === 'allowed');
+    assert.deepEqual((await audit(f.owner)).map(event => event.detail.saveMode), ['browser', 'file']);
+    assert.equal((await audit(f.other)).length, 2);
+    const revoked = (await start()).meta.downloadId;
+    await f.owner.rpc('deliveries.revoke', { deliveryId });
+    await assert.rejects(f.other.rpc('download.finish', { ...receipt, downloadId: revoked }), /DELIVERY_UNAVAILABLE/);
+    assert.equal((await audit(f.owner)).length, 2);
+  }, '中途、跨连接、摘要不匹配或授权失效均不能确认。原生保存与浏览器接管分开记账，重发只记录一次。');
   await run('SQLite 7 迁移：既有文件仍在根目录，审计与传输保持一致', async f => {
     const bytes = Buffer.from('version 7 file');
     const fileId = await f.upload(bytes);

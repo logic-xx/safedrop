@@ -10,6 +10,7 @@ const names: Record<string,string> = {
   'invitations.create':'创建邀请','invitations.revoke':'撤销邀请','registration.set':'修改注册策略',
   'upload.init':'准备上传','upload.finish':'上传完成','upload.chunk':'上传分块','upload.cancel':'取消上传',
   'upload.prepare':'准备上传','download.init':'开始下载','download.chunk':'读取下载分块',
+  'download.finish':'下载回执',
   'files.rename':'重命名文件','files.delete':'删除文件','files.delete.requested':'请求删除文件',
   'folders.create':'新建文件夹','files.move':'移动文件',
   'upload.cancel.requested':'请求取消上传','files.scan.request':'请求文件扫描','files.scan.begin':'开始文件扫描',
@@ -21,6 +22,7 @@ const names: Record<string,string> = {
 };
 export function eventTitle(event: SecurityEvent) {
   if(event.action==='files.scan')return event.detail.state==='clean'?'文件扫描通过':event.detail.state==='quarantined'?'检测到威胁并隔离':event.detail.state==='error'?'文件扫描未通过':names[event.action];
+  if(event.action==='download.finish' && event.result==='allowed')return event.detail.saveMode==='file'?'客户端确认已保存':'客户端确认已交给浏览器';
   return names[event.action] ?? event.action;
 }
 export function eventStatus(event: SecurityEvent) {

@@ -8,6 +8,7 @@ Object.assign(messages, {
   INVALID_FOLDER_NAME: '文件夹名称过长，请缩短后重试',
   FOLDER_NAME_EXISTS: '根目录已有同名文件夹',
   FOLDER_LIMIT: '个人文件夹数量已达上限',
+  DOWNLOAD_RECEIPT_INVALID: '下载回执无效或已失效',
   INVALID_EVENT_RANGE: '结束时间须晚于开始时间，事件查询范围最多为 31 天',
   INVALID_EVENT_CURSOR: '事件翻页位置无效，请刷新事件后重试',
   EVENT_RESPONSE_TOO_LARGE: '事件详情超过显示上限，请联系部署维护者检查原始审计记录',
