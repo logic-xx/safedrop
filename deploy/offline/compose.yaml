@@ -1,0 +1,75 @@
+name: safedrop-offline-prepared
+services:
+  app:
+    image: safedrop-offline-app:0.1.0-prepared
+    platform: linux/amd64
+    pull_policy: never
+    environment:
+      APP_ORIGIN: "https://localhost:${SAFEDROP_OFFLINE_PORT:-8443}"
+      CLAMD_HOST: scanner
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    init: true
+    tmpfs: ["/tmp:size=32m,noexec,nosuid"]
+    volumes:
+      - app_data:/data
+    networks: [backend]
+    healthcheck:
+      test: [CMD, /nodejs/bin/node, -e, "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+  scanner:
+    image: safedrop-offline-scanner:0.1.0-prepared
+    platform: linux/amd64
+    pull_policy: never
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 4g
+    cpus: 1.5
+    init: true
+    tmpfs: ["/tmp:size=1536m,noexec,nosuid,uid=65532,gid=65532,mode=0700"]
+    networks: [backend]
+    healthcheck:
+      test: [CMD, /nodejs/bin/node, /scanner/health.mjs]
+      interval: 5s
+      timeout: 5s
+      start_period: 300s
+      retries: 10
+    stop_grace_period: 30s
+    restart: unless-stopped
+  gateway:
+    image: safedrop-offline-gateway:0.1.0-prepared
+    platform: linux/amd64
+    pull_policy: never
+    ports: ["127.0.0.1:${SAFEDROP_OFFLINE_PORT:-8443}:8443"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [backend, edge]
+    depends_on:
+      app: { condition: service_healthy }
+    restart: unless-stopped
+networks:
+  backend: { internal: true }
+  edge: {}
+volumes:
+  app_data:
+  caddy_data:
+  caddy_config:
