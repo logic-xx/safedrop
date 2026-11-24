@@ -2,6 +2,25 @@
 
 分发目录包含 `images.tar`、`compose.yaml`、`compose.no-signature-network.yaml`、`Caddyfile`、`image-manifest.json`、`SHA256SUMS.txt` 和本说明。三张镜像面向 Linux x86-64。Windows 使用 Docker Desktop 的 Linux 引擎和 Docker Compose v2。扫描器内存上限为 4 GiB，请给 Docker 和其他服务预留额外空间。首次启动会创建本包专用的新数据卷、CA 和随机账号。
 
+## 从公开 GHCR 免构建启动
+
+从课程源码根目录打开 PowerShell。下列命令用 `deploy/offline/ghcr.env` 固定三张 Linux x86-64 镜像的摘要。公开镜像可匿名拉取。端口 8443 已占用时，先设置 `$env:SAFEDROP_OFFLINE_PORT='18446'`。
+
+```powershell
+$options = @('--env-file', 'deploy/offline/ghcr.env', '-f', 'deploy/offline/compose.yaml', '-p', 'safedrop-ghcr-review')
+docker compose @options pull --policy always
+if ($LASTEXITCODE -ne 0) { throw 'GHCR 镜像拉取失败' }
+docker compose @options up -d --no-build --pull never --wait --wait-timeout 600
+if ($LASTEXITCODE -ne 0) { throw 'SafeDrop 启动失败' }
+docker compose @options ps
+$reviewDir = '.local/ghcr-review'
+New-Item -ItemType Directory -Force $reviewDir | Out-Null
+docker compose @options cp gateway:/data/caddy/pki/authorities/local/root.crt "$reviewDir/ca.crt"
+docker compose @options cp app:/data/accounts.json "$reviewDir/accounts.json"
+```
+
+核对并信任本次实例的公开 CA，再访问 `https://localhost:8443`（或所选端口）。私下查看本次生成的账号。结束时运行 `docker compose @options stop`，数据卷仍保留。签名更新要求见下文。
+
 ## 校验与导入
 
 打包时另存了外层 `.tar.gz.sha256`。先从可信途径核对该文件，再用 `Get-FileHash -Algorithm SHA256` 对照压缩包的摘要。将 `.tar.gz` 解到新目录，在该目录打开普通 PowerShell，执行以下命令。校验结束时会显示 `SHA-256 OK`。
@@ -23,8 +42,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Docker image import failed' }
 ```
 
 `image-manifest.json` 记录三张镜像的标签、来源、实际 ID 和归档摘要。OCI 归档另列索引或目标摘要及 Linux amd64 清单摘要。经典镜像存储的本地 ID 对应配置摘要，containerd 镜像存储的本地 ID 对应清单或索引。校验和用于核对收到的字节，可信来源由分发者另行确认。 [Docker 镜像导入说明](https://docs.docker.com/reference/cli/docker/image/load/)
-
-也可使用已公开发布的镜像。取得分发者确认的三个 `仓库@sha256:…` 后，分别设置 `SAFEDROP_APP_IMAGE`、`SAFEDROP_GATEWAY_IMAGE` 和 `SAFEDROP_SCANNER_IMAGE`，运行 `docker compose pull --policy always`。启动时沿用同一组镜像引用。来自镜像仓库的公开访问与摘要由发布后实测确认。
 
 ## 启动与登录
 

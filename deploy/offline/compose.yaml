@@ -61,7 +61,11 @@ services:
     mem_limit: 128m
     cpus: 0.5
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - type: bind
+        source: ../Caddyfile.local
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind: { create_host_path: false }
       - caddy_data:/data
       - caddy_config:/config
     networks: [backend, edge]

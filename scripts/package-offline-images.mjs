@@ -251,7 +251,9 @@ async function makeBundle(keepRunning) {
     assert.equal(appVersion, '0.1.0');
 
     const template = readFileSync(join(root, 'deploy', 'offline', 'compose.yaml'), 'utf8');
-    writeFileSync(join(bundle, 'compose.yaml'), template.replaceAll('0.1.0-prepared', tag).replace('safedrop-offline-prepared', defaultProject));
+    assert.ok(template.includes('source: ../Caddyfile.local'), 'Gateway bind must point to the repository Caddyfile');
+    writeFileSync(join(bundle, 'compose.yaml'), template.replaceAll('0.1.0-prepared', tag)
+      .replace('safedrop-offline-prepared', defaultProject).replace('source: ../Caddyfile.local', 'source: ./Caddyfile'));
     copyFileSync(join(root, 'deploy', 'offline', noSignatureNetwork), join(bundle, noSignatureNetwork));
     copyFileSync(join(root, 'deploy', 'Caddyfile.local'), join(bundle, 'Caddyfile'));
     const guide = readFileSync(join(root, 'deploy', 'offline', 'README.md'), 'utf8');
