@@ -31,7 +31,9 @@ try{
  const bytes=Buffer.from('SafeDrop harmless delivery expiry runtime probe.\n'),fileId=randomUUID();writeFileSync(join(config.root,'objects',fileId),bytes);
  app.store.run('INSERT INTO files VALUES(?,?,?,?,?,?)',fileId,ids['expiry-owner'],'expiry-probe.txt',bytes.length,digest(bytes),Date.now());await owner.rpc('files.scan',{fileId});
  for(let n=0;n<400&&app.scans.status(app.store.get('SELECT * FROM files WHERE id=?',fileId)).state!=='clean';n++)await pause(25);
- const verdict=app.scans.status(app.store.get('SELECT * FROM files WHERE id=?',fileId));assert.equal(verdict.state,'clean');assert.match(verdict.engine,/^ClamAV 1\.5\.5\//);
+ const verdict=app.scans.status(app.store.get('SELECT * FROM files WHERE id=?',fileId));
+ assert.equal(verdict.state,'clean',`Delivery expiry probe requires a clean scan (scan code: ${verdict.code || 'unreported'})`);
+ assert.match(verdict.engine,/^ClamAV 1\.5\.5\//);
  const send=async(recipient='expiry-reader',hours=1)=>(await owner.rpc('deliveries.create',{fileId,recipient,hours})).meta;
  clock=Date.now();const old=await send();assert.equal(old.expires,clock+3600000);assert.deepEqual(Buffer.from((await reader.rpc('download.chunk',{fileId,deliveryId:old.deliveryId,offset:0})).payload),bytes);
  assert.equal((await send('expiry-reader',720)).expires,old.expires);await assert.rejects(owner.rpc('deliveries.create',{fileId,recipient:'expiry-other',hours:0}),/INVALID_DELIVERY_EXPIRY/);

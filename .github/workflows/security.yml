@@ -111,6 +111,10 @@ jobs:
         id: runtime
         shell: pwsh
         run: ./scripts/verify-container.ps1
+      - name: Show scanner logs after runtime verification fails
+        if: failure() && steps.runtime.outcome == 'failure'
+        continue-on-error: true
+        run: docker compose -p safedrop-check -f compose.yaml -f deploy/compose.verify.yaml logs --no-color --tail 100 scanner
       - name: Record sanitized runtime results
         if: always() && steps.runtime.outcome == 'success'
         run: npm run ci:runtime-report
